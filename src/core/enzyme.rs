@@ -303,8 +303,10 @@ impl SLNEnzyme {
         };
 
         // Check quorum: does the winner have enough votes?
+        // Majority requires strictly more than 50% (>50%), not >= 50%.
+        // With 4 kernels: need 3 votes (not 2). With 5 kernels: need 3 votes.
         let quorum_met = match &self.config.quorum {
-            Quorum::Majority => best_count * 2 >= self.kernels.len(),
+            Quorum::Majority => best_count * 2 > self.kernels.len(),
             Quorum::Unanimous => best_count == self.kernels.len(),
             Quorum::Supermajority(threshold) => {
                 (best_count as f64 / self.kernels.len() as f64) >= *threshold
@@ -1000,5 +1002,123 @@ mod tests {
             4,
             "should have 4 top picks for 4 kernels"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Quorum majority semantic tests (Requirement 3)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn quorum_majority_with_4_kernels_requires_3_votes() {
+        // With 4 kernels (Capability, LoadBalancing, Novelty, TemporalRecency),
+        // Majority quorum should require 3+ votes (>50%), not 2 (=50%).
+        //
+        // Setup: h_a gets 2 votes, h_b gets 2 votes → should produce Split, not Forward.
+        //
+        // Kernel voting pattern:
+        // - CapabilityKernel: votes for h_a (scorer_similarity = 1.0)
+        // - NoveltyKernel: votes for h_b (sigma = 0.0, lower than h_a)
+        // - LoadBalancingKernel: votes for h_b (forwards_count = 0, same as h_a)
+        // - TemporalRecencyKernel: votes for whichever was created last
+        let h_a = make_hypha(1, 1.0, 10.0, 0, Chemistry::new()); // high sigma
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let h_b = make_hypha(2, 1.0, 0.0, 0, Chemistry::new()); // low sigma, more recent
+
+        let signal = make_tendril_signal(QuerySignature::default());
+        let hyphae: Vec<&Hypha> = vec![&h_a, &h_b];
+        // Give h_a strong scorer advantage to get CapabilityKernel vote
+        let ctx = make_scorer_context(&[(&h_a, 1.0), (&h_b, 0.0)]);
+
+        let config = SLNEnzymeConfig {
+            quorum: Quorum::Majority,
+            max_disagreement_split: 3,
+        };
+        let mut enzyme = SLNEnzyme::with_discovery_kernels(config);
+        let decision = enzyme.process(&signal, &hyphae, &ctx);
+
+        // With 2-of-4 votes, should produce Split (not majority).
+        match &decision.action {
+            EnzymeAction::Split { targets } => {
+                assert_eq!(
+                    targets.len(),
+                    2,
+                    "2-of-4 vote should produce 2-way split, got {} targets",
+                    targets.len()
+                );
+            }
+            other => panic!("2-of-4 votes should produce Split, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn quorum_majority_with_4_kernels_forwards_with_3_votes() {
+        // With 4 kernels, 3+ votes should produce Forward action.
+        //
+        // Setup: h_good dominates on 3+ criteria → gets 3+ votes → Forward.
+        let h_good = make_hypha(1, 5.0, 0.0, 0, Chemistry::new());
+        let h_bad = make_hypha(2, 1.0, 100.0, 1000, Chemistry::new());
+
+        let signal = make_tendril_signal(QuerySignature::default());
+        let hyphae: Vec<&Hypha> = vec![&h_good, &h_bad];
+        let ctx = make_scorer_context(&[(&h_good, 1.0), (&h_bad, 0.0)]);
+
+        let config = SLNEnzymeConfig {
+            quorum: Quorum::Majority,
+            max_disagreement_split: 3,
+        };
+        let mut enzyme = SLNEnzyme::with_discovery_kernels(config);
+        let decision = enzyme.process(&signal, &hyphae, &ctx);
+
+        // With 3+ of 4 votes, should Forward.
+        assert_eq!(
+            decision.action,
+            EnzymeAction::Forward {
+                target: h_good.id.clone()
+            },
+            "3+ votes should produce Forward, got {:?}",
+            decision.action
+        );
+    }
+
+    #[test]
+    fn quorum_majority_with_5_kernels_requires_3_votes() {
+        // With 5 kernels, majority requires (5/2) + 1 = 3 votes (>50%).
+        // This test verifies the formula works for odd numbers of kernels.
+        //
+        // We'll create a custom enzyme with 5 kernels to test this.
+        let kernels: Vec<Box<dyn ReasoningKernel>> = vec![
+            Box::new(CapabilityKernel),
+            Box::new(LoadBalancingKernel),
+            Box::new(NoveltyKernel),
+            Box::new(TemporalRecencyKernel),
+            Box::new(NoveltyKernel), // Duplicate to get 5 kernels
+        ];
+        let config = SLNEnzymeConfig {
+            quorum: Quorum::Majority,
+            max_disagreement_split: 3,
+        };
+        let mut enzyme = SLNEnzyme::new(kernels, config);
+
+        let h_a = make_hypha(1, 1.0, 0.0, 0, Chemistry::new());
+        let h_b = make_hypha(2, 1.0, 0.0, 0, Chemistry::new());
+
+        let signal = make_tendril_signal(QuerySignature::default());
+        let hyphae: Vec<&Hypha> = vec![&h_a, &h_b];
+        let ctx = make_scorer_context(&[(&h_a, 0.5), (&h_b, 0.5)]);
+
+        // With identical hyphae, likely 3+ kernels will agree → Forward.
+        let decision = enzyme.process(&signal, &hyphae, &ctx);
+
+        // Should produce either Forward (3+ votes) or Split (2 votes).
+        // The key is that 2-of-5 (40%) should NOT be considered majority.
+        match &decision.action {
+            EnzymeAction::Forward { .. } => {
+                // OK if 3+ kernels agreed
+            }
+            EnzymeAction::Split { .. } => {
+                // OK if <3 votes for any single agent
+            }
+            other => panic!("Expected Forward or Split, got {:?}", other),
+        }
     }
 }

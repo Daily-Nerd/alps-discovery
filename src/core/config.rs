@@ -117,9 +117,12 @@ impl Default for ExplorationConfig {
 
 impl ExplorationConfig {
     /// Compute current epsilon given total feedback count.
+    ///
+    /// Uses floating-point exponentiation to handle feedback counts up to u64::MAX
+    /// without overflow. The result is clamped to [epsilon_floor, epsilon_initial].
     pub fn current_epsilon(&self, feedback_count: u64) -> f64 {
-        let epsilon = self.epsilon_initial * self.epsilon_decay_rate.powi(feedback_count as i32);
-        epsilon.max(self.epsilon_floor)
+        let epsilon = self.epsilon_initial * self.epsilon_decay_rate.powf(feedback_count as f64);
+        epsilon.clamp(self.epsilon_floor, self.epsilon_initial)
     }
 }
 
@@ -133,5 +136,44 @@ pub struct SporeConfig {
 impl Default for SporeConfig {
     fn default() -> Self {
         Self { ring_count: 5 }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exploration_config_epsilon_handles_u64_max() {
+        let config = ExplorationConfig::default();
+        let epsilon = config.current_epsilon(u64::MAX);
+
+        // Should clamp to floor, not panic or return NaN/infinity
+        assert!(epsilon >= config.epsilon_floor);
+        assert!(epsilon <= config.epsilon_initial);
+        assert!(!epsilon.is_nan());
+        assert!(!epsilon.is_infinite());
+    }
+
+    #[test]
+    fn exploration_config_epsilon_decay() {
+        let config = ExplorationConfig {
+            epsilon_initial: 0.8,
+            epsilon_floor: 0.05,
+            epsilon_decay_rate: 0.99,
+        };
+
+        // After 0 feedback, should be initial
+        let epsilon0 = config.current_epsilon(0);
+        assert!((epsilon0 - 0.8).abs() < f64::EPSILON);
+
+        // After 100 feedback, should have decayed
+        let epsilon100 = config.current_epsilon(100);
+        assert!(epsilon100 < epsilon0);
+        assert!(epsilon100 >= config.epsilon_floor);
+
+        // After many feedbacks, should approach floor
+        let epsilon_large = config.current_epsilon(10_000);
+        assert!((epsilon_large - config.epsilon_floor).abs() < 0.01);
     }
 }
