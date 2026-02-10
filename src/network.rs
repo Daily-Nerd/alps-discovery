@@ -38,6 +38,7 @@ pub struct DiscoveryResult {
 
 /// Per-agent record stored in the network.
 struct AgentRecord {
+    #[allow(dead_code)]
     capabilities: Vec<String>,
     cap_signatures: Vec<[u8; 64]>,
     endpoint: Option<String>,
