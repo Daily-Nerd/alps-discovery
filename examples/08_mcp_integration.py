@@ -97,5 +97,52 @@ for q in test_queries:
         print(f"  '{q}' -> NO MATCHES")
     print()
 
+# --- Per-query-type feedback ---
+# Feedback is query-specific: recording success for a translation query
+# boosts the agent for future translation-like queries, NOT for summarization.
+
+print("=" * 60)
+print("Per-query-type feedback demo")
+print("=" * 60)
+print()
+
+# Use two query types that both match translate-mcp-server.
+translate_query = "translate legal contract to German"
+detect_query = "detect language of this text"
+
+# Snapshot scores before feedback.
+def score_for(results, agent_name):
+    for r in results:
+        if r.agent_name == agent_name:
+            return r.score
+    return None
+
+trans_score_before = score_for(network.discover(translate_query), "translate-mcp-server")
+detect_score_before = score_for(network.discover(detect_query), "translate-mcp-server")
+
+print(f"Before feedback (translate-mcp-server scores):")
+print(f"  '{translate_query}' -> score={trans_score_before:.4f}")
+print(f"  '{detect_query}'       -> score={detect_score_before:.4f}")
+print()
+
+# Record 10 translation successes WITH the query that triggered them.
+# This tells the routing engine: "this agent is good at translation-like queries."
+for _ in range(10):
+    network.record_success("translate-mcp-server", query=translate_query)
+
+trans_score_after = score_for(network.discover(translate_query), "translate-mcp-server")
+detect_score_after = score_for(network.discover(detect_query), "translate-mcp-server")
+
+print(f"After 10 translation successes (with query context):")
+print(f"  '{translate_query}' -> score={trans_score_after:.4f}")
+print(f"  '{detect_query}'       -> score={detect_score_after:.4f}")
+print()
+
+trans_boost = (trans_score_after - trans_score_before) / trans_score_before * 100
+detect_boost = (detect_score_after - detect_score_before) / detect_score_before * 100
+print(f"  Translation query boost: +{trans_boost:.1f}%")
+print(f"  Detect query boost:     +{detect_boost:.1f}% (much smaller — different query type)")
+print()
+
 # You can also customize the threshold:
 # network = alps.LocalNetwork(similarity_threshold=0.2)  # stricter filtering

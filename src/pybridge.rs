@@ -117,16 +117,29 @@ impl PyLocalNetwork {
 
     /// Record a successful interaction with an agent.
     ///
-    /// Improves the agent's ranking in future queries.
-    fn record_success(&mut self, agent_name: &str) {
-        self.inner.record_success(agent_name);
+    /// If `query` is provided, future queries similar to it will boost
+    /// this agent's ranking — without affecting unrelated query types.
+    /// Always applies a small global ranking improvement regardless.
+    ///
+    /// Args:
+    ///     agent_name: The agent that succeeded.
+    ///     query: The query that led to this interaction (recommended).
+    #[pyo3(signature = (agent_name, *, query=None))]
+    fn record_success(&mut self, agent_name: &str, query: Option<&str>) {
+        self.inner.record_success(agent_name, query);
     }
 
     /// Record a failed interaction with an agent.
     ///
-    /// Reduces the agent's ranking in future queries.
-    fn record_failure(&mut self, agent_name: &str) {
-        self.inner.record_failure(agent_name);
+    /// If `query` is provided, future queries similar to it will penalize
+    /// this agent's ranking — without affecting unrelated query types.
+    ///
+    /// Args:
+    ///     agent_name: The agent that failed.
+    ///     query: The query that led to this interaction (recommended).
+    #[pyo3(signature = (agent_name, *, query=None))]
+    fn record_failure(&mut self, agent_name: &str, query: Option<&str>) {
+        self.inner.record_failure(agent_name, query);
     }
 
     /// Number of registered agents.

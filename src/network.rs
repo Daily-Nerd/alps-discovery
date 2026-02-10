@@ -4,7 +4,7 @@
 // No networking, no decay, no membrane — just the routing engine
 // applied to Chemistry-based capability matching.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use crate::core::chemistry::Chemistry;
@@ -36,6 +36,20 @@ pub struct DiscoveryResult {
     pub metadata: HashMap<String, String>,
 }
 
+/// Maximum number of feedback records stored per agent.
+const MAX_FEEDBACK_RECORDS: usize = 100;
+
+/// Strength of per-query feedback adjustment to diameter (max ±50%).
+const FEEDBACK_STRENGTH: f64 = 0.5;
+
+/// A single recorded outcome for a specific query type.
+struct FeedbackRecord {
+    /// MinHash signature of the query that produced this outcome.
+    query_minhash: [u8; 64],
+    /// +1.0 for success, -1.0 for failure.
+    outcome: f64,
+}
+
 /// Per-agent record stored in the network.
 struct AgentRecord {
     #[allow(dead_code)]
@@ -44,6 +58,8 @@ struct AgentRecord {
     endpoint: Option<String>,
     metadata: HashMap<String, String>,
     hypha: Hypha,
+    /// Per-query-type feedback history (most recent last).
+    feedback: VecDeque<FeedbackRecord>,
 }
 
 /// Local-mode agent discovery network.
@@ -142,6 +158,7 @@ impl LocalNetwork {
                 endpoint: endpoint.map(|s| s.to_string()),
                 metadata,
                 hypha,
+                feedback: VecDeque::new(),
             },
         );
     }
@@ -163,9 +180,9 @@ impl LocalNetwork {
 
         let query_sig = compute_query_signature(query.as_bytes(), &self.lsh_config);
 
-        // Score all agents: max per-capability similarity × diameter.
-        // Using max over individual capability signatures avoids the dilution
-        // problem where element-wise MIN accumulation merges unrelated capabilities.
+        // Score all agents: max per-capability similarity × diameter, adjusted
+        // by per-query-type feedback. Feedback from similar past queries boosts
+        // or penalizes the agent for THIS query type without affecting unrelated queries.
         let mut results: Vec<DiscoveryResult> = self
             .agents
             .iter()
@@ -175,7 +192,17 @@ impl LocalNetwork {
                     .iter()
                     .map(|sig| MinHasher::similarity(sig, &query_sig.minhash))
                     .fold(0.0f64, f64::max);
-                let score = sim * record.hypha.state.diameter;
+
+                // Per-query feedback: weighted average of outcomes for similar queries.
+                let feedback_factor = Self::compute_feedback_factor(
+                    &record.feedback,
+                    &query_sig.minhash,
+                    self.lsh_config.similarity_threshold,
+                );
+                let adjusted_diameter =
+                    record.hypha.state.diameter * (1.0 + feedback_factor * FEEDBACK_STRENGTH);
+
+                let score = sim * adjusted_diameter;
                 DiscoveryResult {
                     agent_name: name.clone(),
                     similarity: sim,
@@ -222,21 +249,89 @@ impl LocalNetwork {
     }
 
     /// Record a successful interaction with an agent.
-    pub fn record_success(&mut self, agent_name: &str) {
+    ///
+    /// If `query` is provided, stores per-query-type feedback so future
+    /// queries similar to this one boost the agent's ranking — without
+    /// affecting unrelated query types.
+    ///
+    /// Global diameter adjustment always applies regardless of query.
+    pub fn record_success(&mut self, agent_name: &str, query: Option<&str>) {
         if let Some(record) = self.agents.get_mut(agent_name) {
+            // Global boost (always).
             record.hypha.state.tau += 0.05;
             record.hypha.state.sigma += 0.01;
             record.hypha.state.diameter = (record.hypha.state.diameter + 0.01).min(1.0);
             record.hypha.state.consecutive_pulse_timeouts = 0;
+
+            // Per-query-type feedback (if query provided).
+            if let Some(q) = query {
+                let sig = compute_query_signature(q.as_bytes(), &self.lsh_config);
+                record.feedback.push_back(FeedbackRecord {
+                    query_minhash: sig.minhash,
+                    outcome: 1.0,
+                });
+                if record.feedback.len() > MAX_FEEDBACK_RECORDS {
+                    record.feedback.pop_front();
+                }
+            }
         }
     }
 
     /// Record a failed interaction with an agent.
-    pub fn record_failure(&mut self, agent_name: &str) {
+    ///
+    /// If `query` is provided, stores per-query-type feedback so future
+    /// queries similar to this one penalize the agent's ranking — without
+    /// affecting unrelated query types.
+    pub fn record_failure(&mut self, agent_name: &str, query: Option<&str>) {
         if let Some(record) = self.agents.get_mut(agent_name) {
+            // Global penalty (always).
             record.hypha.state.consecutive_pulse_timeouts =
                 record.hypha.state.consecutive_pulse_timeouts.saturating_add(1);
             record.hypha.state.diameter = (record.hypha.state.diameter - 0.05).max(0.1);
+
+            // Per-query-type feedback (if query provided).
+            if let Some(q) = query {
+                let sig = compute_query_signature(q.as_bytes(), &self.lsh_config);
+                record.feedback.push_back(FeedbackRecord {
+                    query_minhash: sig.minhash,
+                    outcome: -1.0,
+                });
+                if record.feedback.len() > MAX_FEEDBACK_RECORDS {
+                    record.feedback.pop_front();
+                }
+            }
+        }
+    }
+
+    /// Compute per-query feedback factor for an agent.
+    ///
+    /// Returns a value in [-1.0, 1.0] representing how well this agent has
+    /// performed on queries similar to the current one. 0.0 means no relevant
+    /// feedback exists.
+    fn compute_feedback_factor(
+        feedback: &VecDeque<FeedbackRecord>,
+        query_minhash: &[u8; 64],
+        relevance_threshold: f64,
+    ) -> f64 {
+        if feedback.is_empty() {
+            return 0.0;
+        }
+
+        let mut weighted_sum = 0.0;
+        let mut weight_sum = 0.0;
+
+        for fb in feedback {
+            let relevance = MinHasher::similarity(&fb.query_minhash, query_minhash);
+            if relevance >= relevance_threshold {
+                weighted_sum += relevance * fb.outcome;
+                weight_sum += relevance;
+            }
+        }
+
+        if weight_sum > 0.0 {
+            (weighted_sum / weight_sum).clamp(-1.0, 1.0)
+        } else {
+            0.0
         }
     }
 
@@ -344,7 +439,7 @@ mod tests {
         reg(&mut network, "agent-b", &["data processing"]);
 
         for _ in 0..20 {
-            network.record_success("agent-a");
+            network.record_success("agent-a", None);
         }
 
         let results = network.discover("data processing");
@@ -366,7 +461,7 @@ mod tests {
         reg(&mut network, "agent-b", &["data processing"]);
 
         for _ in 0..10 {
-            network.record_failure("agent-a");
+            network.record_failure("agent-a", None);
         }
 
         let results = network.discover("data processing");
@@ -524,5 +619,96 @@ mod tests {
         // With threshold 0.0, even noise matches should appear
         // (unless they happen to have exactly 0.0 similarity)
         assert!(results.len() <= 1); // might or might not match
+    }
+
+    #[test]
+    fn per_query_feedback_boosts_similar_queries() {
+        // Two identical agents. Record translation successes for agent-a.
+        // Translation-like queries should prefer agent-a.
+        // Summarization queries should NOT prefer agent-a.
+        let mut network = LocalNetwork::new();
+        reg(
+            &mut network,
+            "agent-a",
+            &["legal translation", "document summarization"],
+        );
+        reg(
+            &mut network,
+            "agent-b",
+            &["legal translation", "document summarization"],
+        );
+
+        // Record translation successes for agent-a WITH query context.
+        for _ in 0..10 {
+            network.record_success("agent-a", Some("translate legal contract to German"));
+        }
+
+        // Translation-like query → agent-a should be boosted.
+        let results = network.discover("translate patent application to French");
+        assert!(results.len() >= 2);
+        let a = results.iter().find(|r| r.agent_name == "agent-a").unwrap();
+        let b = results.iter().find(|r| r.agent_name == "agent-b").unwrap();
+        assert!(
+            a.score > b.score,
+            "agent-a ({:.4}) should outscore agent-b ({:.4}) for translation queries",
+            a.score, b.score
+        );
+
+        // Summarization query → scores should be close (no translation feedback boost).
+        let results = network.discover("summarize this legal brief");
+        let a = results.iter().find(|r| r.agent_name == "agent-a").unwrap();
+        let b = results.iter().find(|r| r.agent_name == "agent-b").unwrap();
+        // agent-a still has a small global diameter boost from record_success,
+        // but the per-query feedback should NOT amplify it for summarization.
+        let ratio = a.score / b.score;
+        assert!(
+            ratio < 1.3,
+            "agent-a/agent-b score ratio ({:.3}) should be close for unrelated query type",
+            ratio
+        );
+    }
+
+    #[test]
+    fn per_query_failure_penalizes_similar_queries() {
+        let mut network = LocalNetwork::new();
+        reg(&mut network, "agent-a", &["legal translation"]);
+        reg(&mut network, "agent-b", &["legal translation"]);
+
+        // Record translation failures for agent-a.
+        for _ in 0..10 {
+            network.record_failure("agent-a", Some("translate legal contract"));
+        }
+
+        // Translation query → agent-b should win.
+        let results = network.discover("translate patent to German");
+        assert!(results.len() >= 2);
+        let a = results.iter().find(|r| r.agent_name == "agent-a").unwrap();
+        let b = results.iter().find(|r| r.agent_name == "agent-b").unwrap();
+        assert!(
+            b.score > a.score,
+            "agent-b ({:.4}) should outscore agent-a ({:.4}) after translation failures",
+            b.score, a.score
+        );
+    }
+
+    #[test]
+    fn feedback_without_query_still_works_globally() {
+        // Backward compat: record_success(name, None) does global diameter boost.
+        let mut network = LocalNetwork::new();
+        reg(&mut network, "agent-a", &["data processing"]);
+        reg(&mut network, "agent-b", &["data processing"]);
+
+        for _ in 0..20 {
+            network.record_success("agent-a", None);
+        }
+
+        let results = network.discover("data processing");
+        assert!(results.len() >= 2);
+        let a = results.iter().find(|r| r.agent_name == "agent-a").unwrap();
+        let b = results.iter().find(|r| r.agent_name == "agent-b").unwrap();
+        assert!(
+            a.score >= b.score,
+            "global feedback should still boost agent-a"
+        );
     }
 }
