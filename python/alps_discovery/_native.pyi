@@ -96,6 +96,14 @@ class LocalNetwork:
         """Record a failed interaction. Reduces agent ranking."""
         ...
 
+    def tick(self) -> None:
+        """Apply temporal decay to all agent pheromone state.
+
+        Call periodically to prevent stale agents from retaining
+        inflated scores indefinitely.
+        """
+        ...
+
     @property
     def agent_count(self) -> int:
         """Number of registered agents."""

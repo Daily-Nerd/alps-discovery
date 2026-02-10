@@ -128,8 +128,14 @@ struct CandidateRef<'a> {
 /// Maximum number of feedback records stored per agent.
 const MAX_FEEDBACK_RECORDS: usize = 100;
 
-/// Strength of per-query feedback adjustment to diameter (max ±50%).
-const FEEDBACK_STRENGTH: f64 = 0.5;
+/// Strength of per-query feedback adjustment to diameter (max ±20%).
+/// Research: "Low-exploitation + high-fan-out outperforms high-exploitation
+/// + low-fan-out in sparse networks."
+const FEEDBACK_STRENGTH: f64 = 0.2;
+
+/// Minimum floor for tau pheromone. Prevents tau=0 absorbing state
+/// which creates infinite first-mover advantage (zero-trap).
+const TAU_FLOOR: f64 = 0.001;
 
 /// A single recorded outcome for a specific query type.
 struct FeedbackRecord {
@@ -718,11 +724,12 @@ impl LocalNetwork {
     /// Global diameter adjustment always applies regardless of query.
     pub fn record_success(&mut self, agent_name: &str, query: Option<&str>) {
         if let Some(record) = self.agents.get_mut(agent_name) {
-            // Global boost (always).
-            record.hypha.state.tau += 0.05;
+            // Global boost (always). Floor prevents zero-trap absorbing state.
+            record.hypha.state.tau = (record.hypha.state.tau + 0.05).max(TAU_FLOOR);
             record.hypha.state.sigma += 0.01;
             record.hypha.state.diameter = (record.hypha.state.diameter + 0.01).min(1.0);
             record.hypha.state.consecutive_pulse_timeouts = 0;
+            record.hypha.last_activity = Instant::now();
 
             // Per-query-type feedback (if query provided).
             if let Some(q) = query {
@@ -796,6 +803,22 @@ impl LocalNetwork {
             (weighted_sum / weight_sum).clamp(-1.0, 1.0)
         } else {
             0.0
+        }
+    }
+
+    /// Apply temporal decay to all agent pheromone state.
+    ///
+    /// Call periodically (e.g. once per discovery cycle or on a timer) to
+    /// prevent stale agents from retaining inflated scores indefinitely.
+    /// Tau decays by 0.5% per tick (floor at TAU_FLOOR), sigma by 1%.
+    /// Diameter is not decayed — it represents structural capacity, not
+    /// an ephemeral signal.
+    pub fn tick(&mut self) {
+        for record in self.agents.values_mut() {
+            let s = &mut record.hypha.state;
+            s.tau = (s.tau * 0.995).max(TAU_FLOOR);
+            s.sigma *= 0.99;
+            // diameter stays — structural capacity, not ephemeral signal.
         }
     }
 
@@ -898,9 +921,10 @@ impl LocalNetwork {
             );
 
             // Restore scoring state (register() sets defaults, so override).
+            // Enforce TAU_FLOOR for backward compat with snapshots that had tau=0.
             if let Some(record) = network.agents.get_mut(&agent.name) {
                 record.hypha.state.diameter = agent.diameter;
-                record.hypha.state.tau = agent.tau;
+                record.hypha.state.tau = agent.tau.max(TAU_FLOOR);
                 record.hypha.state.sigma = agent.sigma;
                 record.hypha.state.omega = agent.omega;
                 record.hypha.state.forwards_count = agent.forwards_count;
@@ -2147,6 +2171,185 @@ mod tests {
             r.enzyme_score >= 0.0 && r.enzyme_score <= 1.0,
             "enzyme_score ({}) should be in [0, 1]",
             r.enzyme_score
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // P1.1: Tau floor (zero-trap protection)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn tau_never_below_floor() {
+        let mut network = LocalNetwork::new();
+        reg(&mut network, "agent-a", &["data processing"]);
+
+        // Fresh agent should have tau >= TAU_FLOOR.
+        let tau_initial = network.agents.get("agent-a").unwrap().hypha.state.tau;
+        assert!(
+            tau_initial >= TAU_FLOOR,
+            "initial tau ({}) should be >= TAU_FLOOR ({})",
+            tau_initial,
+            TAU_FLOOR
+        );
+
+        // After many ticks (decay), tau should still be >= TAU_FLOOR.
+        for _ in 0..10000 {
+            network.tick();
+        }
+        let tau_after = network.agents.get("agent-a").unwrap().hypha.state.tau;
+        assert!(
+            tau_after >= TAU_FLOOR,
+            "decayed tau ({}) should be >= TAU_FLOOR ({})",
+            tau_after,
+            TAU_FLOOR
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // P1.4: Pheromone decay via tick()
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn tick_decays_tau_and_sigma() {
+        let mut network = LocalNetwork::new();
+        reg(&mut network, "agent-a", &["data processing"]);
+
+        // Inflate sigma via successes.
+        for _ in 0..50 {
+            network.record_success("agent-a", Some("data processing"));
+        }
+        let sigma_before = network.agents.get("agent-a").unwrap().hypha.state.sigma;
+        let tau_before = network.agents.get("agent-a").unwrap().hypha.state.tau;
+        assert!(sigma_before > 0.0);
+        assert!(tau_before > 0.0);
+
+        // Apply ticks.
+        for _ in 0..100 {
+            network.tick();
+        }
+        let sigma_after = network.agents.get("agent-a").unwrap().hypha.state.sigma;
+        let tau_after = network.agents.get("agent-a").unwrap().hypha.state.tau;
+        assert!(
+            sigma_after < sigma_before,
+            "sigma should decay: before={:.4}, after={:.4}",
+            sigma_before,
+            sigma_after
+        );
+        assert!(
+            tau_after < tau_before,
+            "tau should decay: before={:.4}, after={:.4}",
+            tau_before,
+            tau_after
+        );
+    }
+
+    #[test]
+    fn stale_agents_lose_ranking_advantage() {
+        use crate::scorer::Scorer;
+
+        struct EqualScorer;
+        impl Scorer for EqualScorer {
+            fn index_capabilities(&mut self, _: &str, _: &[&str]) {}
+            fn remove_agent(&mut self, _: &str) {}
+            fn score(&self, _: &str) -> Result<Vec<(String, f64)>, String> {
+                Ok(vec![
+                    ("agent-old".to_string(), 0.8),
+                    ("agent-new".to_string(), 0.8),
+                ])
+            }
+        }
+
+        let mut network = LocalNetwork::with_scorer(Box::new(EqualScorer));
+        network.register("agent-old", &["service"], None, HashMap::new());
+        network.register("agent-new", &["service"], None, HashMap::new());
+
+        // Give agent-old a big advantage via many successes.
+        for _ in 0..50 {
+            network.record_success("agent-old", Some("service"));
+        }
+
+        // Verify agent-old is winning.
+        let results = network.discover("service");
+        assert!(results.len() >= 2);
+        let old_score_before = results
+            .iter()
+            .find(|r| r.agent_name == "agent-old")
+            .unwrap()
+            .score;
+        let new_score_before = results
+            .iter()
+            .find(|r| r.agent_name == "agent-new")
+            .unwrap()
+            .score;
+        assert!(
+            old_score_before > new_score_before,
+            "agent-old should initially outscore agent-new"
+        );
+
+        // Apply many ticks to decay agent-old's advantage.
+        for _ in 0..1000 {
+            network.tick();
+        }
+
+        // Now give agent-new some successes.
+        for _ in 0..20 {
+            network.record_success("agent-new", Some("service"));
+        }
+
+        let results = network.discover("service");
+        let old_score_after = results
+            .iter()
+            .find(|r| r.agent_name == "agent-old")
+            .unwrap()
+            .score;
+        let new_score_after = results
+            .iter()
+            .find(|r| r.agent_name == "agent-new")
+            .unwrap()
+            .score;
+
+        // agent-new should now be competitive (its advantage is less decayed).
+        assert!(
+            new_score_after > old_score_after * 0.5,
+            "agent-new ({:.4}) should be competitive with decayed agent-old ({:.4})",
+            new_score_after,
+            old_score_after
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // P1.5: Signature dimensions validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn config_effective_dimensions_clamped() {
+        let config = LshConfig {
+            dimensions: 256,
+            ..LshConfig::default()
+        };
+        assert_eq!(
+            config.effective_dimensions(),
+            64,
+            "dimensions should clamp to SIGNATURE_SIZE"
+        );
+
+        let config = LshConfig {
+            dimensions: 32,
+            ..LshConfig::default()
+        };
+        assert_eq!(
+            config.effective_dimensions(),
+            32,
+            "dimensions below max should be unchanged"
+        );
+    }
+
+    #[test]
+    fn default_dimensions_equals_signature_size() {
+        let config = LshConfig::default();
+        assert_eq!(
+            config.dimensions, 64,
+            "default dimensions should equal SIGNATURE_SIZE"
         );
     }
 }

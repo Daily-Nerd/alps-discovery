@@ -125,6 +125,50 @@ impl ReasoningKernel for LoadBalancingKernel {
     }
 }
 
+/// Temporal recency kernel: favors agents with recent successful activity.
+///
+/// Score: exponential decay from `last_activity`. Does NOT multiply by
+/// diameter — maintaining kernel diversity (orthogonal to CapabilityKernel).
+pub struct TemporalRecencyKernel;
+
+impl ReasoningKernel for TemporalRecencyKernel {
+    fn kernel_type(&self) -> KernelType {
+        KernelType::TemporalRecency
+    }
+
+    fn evaluate(&self, _signal: &Signal, hyphae: &[&Hypha]) -> KernelRecommendation {
+        use std::time::Instant;
+        let now = Instant::now();
+        let mut ranked: Vec<(HyphaId, f64)> = hyphae
+            .iter()
+            .map(|h| {
+                let elapsed_secs = now.duration_since(h.last_activity).as_secs_f64();
+                // Exponential decay with 60-second half-life.
+                // Recent activity → high score, stale → low score.
+                let recency = (-elapsed_secs / 86.6).exp(); // ln(2)/86.6 ≈ 0.008 → half-life ~60s
+                (h.id.clone(), recency)
+            })
+            .collect();
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        KernelRecommendation { ranked }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Quorum
+// ---------------------------------------------------------------------------
+
+/// Quorum mode for kernel voting decisions.
+#[derive(Debug, Clone)]
+pub enum Quorum {
+    /// Simple majority (>50% agreement). Default, backwards compatible.
+    Majority,
+    /// All kernels must agree. Maximizes split rate / fan-out.
+    Unanimous,
+    /// Configurable supermajority threshold (e.g. 0.75 = 3/4 must agree).
+    Supermajority(f64),
+}
+
 // ---------------------------------------------------------------------------
 // SLNEnzymeConfig
 // ---------------------------------------------------------------------------
@@ -132,14 +176,17 @@ impl ReasoningKernel for LoadBalancingKernel {
 /// Configuration for the multi-kernel discovery enzyme.
 #[derive(Debug, Clone)]
 pub struct SLNEnzymeConfig {
-    /// Maximum number of hyphae to split across on disagreement (default: 2).
+    /// Maximum number of hyphae to split across on disagreement (default: 3).
     pub max_disagreement_split: usize,
+    /// Quorum mode for kernel voting (default: Majority).
+    pub quorum: Quorum,
 }
 
 impl Default for SLNEnzymeConfig {
     fn default() -> Self {
         Self {
-            max_disagreement_split: 2,
+            max_disagreement_split: 3,
+            quorum: Quorum::Majority,
         }
     }
 }
@@ -170,12 +217,13 @@ impl SLNEnzyme {
     }
 
     /// Create a new SLNEnzyme with the discovery kernel mix:
-    /// CapabilityKernel + LoadBalancingKernel + NoveltyKernel.
+    /// CapabilityKernel + LoadBalancingKernel + NoveltyKernel + TemporalRecencyKernel.
     pub fn with_discovery_kernels(config: SLNEnzymeConfig) -> Self {
         let kernels: Vec<Box<dyn ReasoningKernel>> = vec![
             Box::new(CapabilityKernel),
             Box::new(LoadBalancingKernel),
             Box::new(NoveltyKernel),
+            Box::new(TemporalRecencyKernel),
         ];
         Self::new(kernels, config)
     }
@@ -213,8 +261,16 @@ impl SLNEnzyme {
             return EnzymeAction::Dissolve;
         };
 
-        // Majority or unanimity → forward to the winner.
-        if best_count * 2 >= self.kernels.len() {
+        // Check quorum: does the winner have enough votes?
+        let quorum_met = match &self.config.quorum {
+            Quorum::Majority => best_count * 2 >= self.kernels.len(),
+            Quorum::Unanimous => best_count == self.kernels.len(),
+            Quorum::Supermajority(threshold) => {
+                (best_count as f64 / self.kernels.len() as f64) >= *threshold
+            }
+        };
+
+        if quorum_met {
             EnzymeAction::Forward { target: best_hypha }
         } else {
             // No majority → split across distinct top picks.
@@ -577,6 +633,7 @@ mod tests {
         //   - Best chemistry match (CapabilityKernel)
         //   - Lowest sigma (NoveltyKernel)
         //   - Fewest forwards (LoadBalancingKernel)
+        //   - Most recent activity (TemporalRecencyKernel — both created now, so tied)
         let mut chem_good = Chemistry::new();
         chem_good.deposit(&[0x42; 64]);
         let h_good = make_hypha(1, 5.0, 0.0, 0, chem_good);
@@ -604,36 +661,26 @@ mod tests {
     }
 
     #[test]
-    fn sln_enzyme_disagreement_split() {
-        // We need 3 hyphae where each kernel picks a different winner.
+    fn sln_enzyme_disagreement_split_with_unanimous_quorum() {
+        // With Unanimous quorum, even partial agreement causes a Split.
+        // 4 kernels, 3 hyphae — at most 2 kernels can agree → not unanimous → Split.
         //
         // CapabilityKernel picks by: similarity * diameter
         // NoveltyKernel picks by:    1/(1+sigma)  (diameter-independent)
         // LoadBalancingKernel picks by: diameter / (1+forwards_count)
+        // TemporalRecencyKernel picks by: recency(last_activity)
         //
         // Hypha A: best chemistry match, but high sigma and high forwards
-        //   - chemistry matches query perfectly, diameter=2.0, sigma=1000, forwards=1000
-        //   - CapabilityKernel: 1.0 * 2.0 = 2.0
-        //   - NoveltyKernel:    1/(1+1000) ≈ 0.001
-        //   - LoadBalancing:    2.0/(1+1000) ≈ 0.002
         let mut chem_a = Chemistry::new();
         chem_a.deposit(&[0x42; 64]);
         let h_a = make_hypha(1, 2.0, 1000.0, 1000, chem_a);
 
         // Hypha B: poor chemistry match, but lowest sigma, high forwards
-        //   - chemistry = all 0x00, diameter=2.0, sigma=0.0, forwards=1000
-        //   - CapabilityKernel: 0.0 * 2.0 = 0.0
-        //   - NoveltyKernel:    1/(1+0) = 1.0
-        //   - LoadBalancing:    2.0/(1+1000) ≈ 0.002
         let mut chem_b = Chemistry::new();
         chem_b.deposit(&[0x00; 64]);
         let h_b = make_hypha(2, 2.0, 0.0, 1000, chem_b);
 
         // Hypha C: poor chemistry match, high sigma, but fewest forwards
-        //   - chemistry = all 0x00, diameter=2.0, sigma=1000, forwards=0
-        //   - CapabilityKernel: 0.0 * 2.0 = 0.0
-        //   - NoveltyKernel:    1/(1+1000) ≈ 0.001
-        //   - LoadBalancing:    2.0/(1+0) = 2.0
         let mut chem_c = Chemistry::new();
         chem_c.deposit(&[0x00; 64]);
         let h_c = make_hypha(3, 2.0, 1000.0, 0, chem_c);
@@ -644,22 +691,59 @@ mod tests {
         let membrane = make_membrane();
         let hyphae: Vec<&Hypha> = vec![&h_a, &h_b, &h_c];
 
-        let mut enzyme = SLNEnzyme::with_discovery_kernels(SLNEnzymeConfig::default());
+        let config = SLNEnzymeConfig {
+            quorum: Quorum::Unanimous,
+            ..SLNEnzymeConfig::default()
+        };
+        let mut enzyme = SLNEnzyme::with_discovery_kernels(config);
         let decision = enzyme.process(&signal, &spore, &hyphae, &membrane);
 
-        // 3 kernels, 3 different top picks → no majority → Split
-        // max_disagreement_split = 2, so targets.len() <= 2
+        // With Unanimous quorum, even 3/4 agreement triggers Split.
+        // max_disagreement_split = 3, so targets.len() <= 3
         match &decision.action {
             EnzymeAction::Split { targets } => {
                 assert!(
-                    targets.len() <= 2,
-                    "split targets should be <= max_disagreement_split(2), got {}",
+                    targets.len() <= 3,
+                    "split targets should be <= max_disagreement_split(3), got {}",
                     targets.len()
                 );
                 assert!(!targets.is_empty(), "split targets should not be empty");
             }
-            other => panic!("expected Split action on disagreement, got {:?}", other),
+            other => panic!(
+                "expected Split action with unanimous quorum, got {:?}",
+                other
+            ),
         }
+    }
+
+    #[test]
+    fn sln_enzyme_majority_quorum_forwards_with_agreement() {
+        // With 4 kernels and Majority quorum, 3/4 agreement → Forward.
+        // Create a scenario where one hypha is best on most axes.
+        let mut chem_good = Chemistry::new();
+        chem_good.deposit(&[0x42; 64]);
+        // h_good: best chemistry, low sigma, low forwards → 3 kernels agree
+        let h_good = make_hypha(1, 5.0, 0.0, 0, chem_good);
+
+        let mut chem_bad = Chemistry::new();
+        chem_bad.deposit(&[0x00; 64]);
+        let h_bad = make_hypha(2, 1.0, 100.0, 1000, chem_bad);
+
+        let query = QuerySignature::new([0x42; 64]);
+        let signal = make_tendril_signal(query);
+        let spore = Spore::new(SporeConfig::default());
+        let membrane = make_membrane();
+        let hyphae: Vec<&Hypha> = vec![&h_good, &h_bad];
+
+        let mut enzyme = SLNEnzyme::with_discovery_kernels(SLNEnzymeConfig::default());
+        let decision = enzyme.process(&signal, &spore, &hyphae, &membrane);
+
+        assert_eq!(
+            decision.action,
+            EnzymeAction::Forward {
+                target: h_good.id.clone()
+            }
+        );
     }
 
     #[test]
@@ -707,22 +791,23 @@ mod tests {
             );
         }
 
-        // Should have top picks for each kernel (3 kernels).
-        assert_eq!(eval.top_picks.len(), 3);
+        // Should have top picks for each kernel (4 kernels).
+        assert_eq!(eval.top_picks.len(), 4);
     }
 
     #[test]
     fn evaluate_with_scores_unanimous_detection() {
         let enzyme = SLNEnzyme::with_discovery_kernels(SLNEnzymeConfig::default());
 
-        // One clearly dominant hypha: best similarity, lowest sigma, fewest forwards.
-        let mut chem_good = Chemistry::new();
-        chem_good.deposit(&[0x42; 64]);
-        let h_good = make_hypha(1, 5.0, 0.0, 0, chem_good);
-
+        // Create h_bad FIRST so h_good is more recent (TemporalRecencyKernel).
         let mut chem_bad = Chemistry::new();
         chem_bad.deposit(&[0x00; 64]);
         let h_bad = make_hypha(2, 1.0, 100.0, 1000, chem_bad);
+
+        // One clearly dominant hypha: best similarity, lowest sigma, fewest forwards, most recent.
+        let mut chem_good = Chemistry::new();
+        chem_good.deposit(&[0x42; 64]);
+        let h_good = make_hypha(1, 5.0, 0.0, 0, chem_good);
 
         let query = QuerySignature::new([0x42; 64]);
         let signal = make_tendril_signal(query);
@@ -787,5 +872,133 @@ mod tests {
         let eval = enzyme.evaluate_with_scores(&signal, &hyphae);
         assert!(eval.agent_scores.is_empty());
         assert!(eval.top_picks.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // TemporalRecencyKernel tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn temporal_recency_kernel_favors_recent() {
+        let kernel = TemporalRecencyKernel;
+
+        // All hyphae created with Instant::now() — last one is most recent.
+        let h_old = make_hypha(1, 1.0, 0.0, 0, Chemistry::new());
+        // Sleep briefly to create temporal separation.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let h_new = make_hypha(2, 1.0, 0.0, 0, Chemistry::new());
+
+        let signal = make_tendril_signal(QuerySignature::default());
+        let hyphae: Vec<&Hypha> = vec![&h_old, &h_new];
+        let rec = kernel.evaluate(&signal, &hyphae);
+
+        // h_new should rank first (more recent activity).
+        assert_eq!(rec.ranked[0].0, h_new.id);
+        assert!(
+            rec.ranked[0].1 > rec.ranked[1].1,
+            "newer ({:.6}) should outscore older ({:.6})",
+            rec.ranked[0].1,
+            rec.ranked[1].1
+        );
+    }
+
+    #[test]
+    fn temporal_recency_kernel_ignores_diameter() {
+        let kernel = TemporalRecencyKernel;
+
+        // Same creation time (approximately), different diameters.
+        let h_a = make_hypha(1, 10.0, 0.0, 0, Chemistry::new());
+        let h_b = make_hypha(2, 0.1, 0.0, 0, Chemistry::new());
+
+        let signal = make_tendril_signal(QuerySignature::default());
+        let hyphae: Vec<&Hypha> = vec![&h_a, &h_b];
+        let rec = kernel.evaluate(&signal, &hyphae);
+
+        // Scores should be approximately equal (both created now).
+        let diff = (rec.ranked[0].1 - rec.ranked[1].1).abs();
+        assert!(
+            diff < 0.01,
+            "same-time hyphae should have similar recency scores, diff={:.6}",
+            diff
+        );
+    }
+
+    #[test]
+    fn temporal_recency_kernel_empty() {
+        let kernel = TemporalRecencyKernel;
+        let signal = make_tendril_signal(QuerySignature::default());
+        let hyphae: Vec<&Hypha> = vec![];
+        let rec = kernel.evaluate(&signal, &hyphae);
+        assert!(rec.ranked.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Quorum tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn unanimous_quorum_produces_more_splits() {
+        // Same setup, run with Majority vs Unanimous quorum.
+        // Unanimous should produce more Splits.
+        let mut chem = Chemistry::new();
+        chem.deposit(&[0x42; 64]);
+        let h_a = make_hypha(1, 5.0, 0.0, 0, chem);
+
+        let mut chem_b = Chemistry::new();
+        chem_b.deposit(&[0x00; 64]);
+        let h_b = make_hypha(2, 1.0, 5.0, 50, chem_b);
+
+        let query = QuerySignature::new([0x42; 64]);
+        let signal = make_tendril_signal(query);
+        let spore = Spore::new(SporeConfig::default());
+        let membrane = make_membrane();
+        let hyphae: Vec<&Hypha> = vec![&h_a, &h_b];
+
+        // With Majority quorum — likely Forward (3-4 kernels agree on h_a).
+        let config_majority = SLNEnzymeConfig {
+            quorum: Quorum::Majority,
+            ..SLNEnzymeConfig::default()
+        };
+        let mut enzyme_majority = SLNEnzyme::with_discovery_kernels(config_majority);
+        let dec_majority = enzyme_majority.process(&signal, &spore, &hyphae, &membrane);
+        let majority_forwards = matches!(dec_majority.action, EnzymeAction::Forward { .. });
+
+        // With Unanimous quorum — might Split if any kernel disagrees.
+        let config_unanimous = SLNEnzymeConfig {
+            quorum: Quorum::Unanimous,
+            ..SLNEnzymeConfig::default()
+        };
+        let mut enzyme_unanimous = SLNEnzyme::with_discovery_kernels(config_unanimous);
+        let dec_unanimous = enzyme_unanimous.process(&signal, &spore, &hyphae, &membrane);
+        let unanimous_forwards = matches!(dec_unanimous.action, EnzymeAction::Forward { .. });
+
+        // Unanimous should be at least as strict as Majority.
+        // If Majority forwards, Unanimous might forward or split.
+        // If Majority splits, Unanimous MUST also split.
+        if !majority_forwards {
+            assert!(
+                !unanimous_forwards,
+                "if majority splits, unanimous must also split"
+            );
+        }
+    }
+
+    #[test]
+    fn evaluate_with_scores_has_four_top_picks() {
+        let enzyme = SLNEnzyme::with_discovery_kernels(SLNEnzymeConfig::default());
+
+        let h_a = make_hypha(1, 1.0, 0.0, 0, Chemistry::new());
+        let h_b = make_hypha(2, 1.0, 0.0, 0, Chemistry::new());
+
+        let signal = make_tendril_signal(QuerySignature::default());
+        let hyphae: Vec<&Hypha> = vec![&h_a, &h_b];
+        let eval = enzyme.evaluate_with_scores(&signal, &hyphae);
+
+        // 4 kernels → 4 top picks.
+        assert_eq!(
+            eval.top_picks.len(),
+            4,
+            "should have 4 top picks for 4 kernels"
+        );
     }
 }

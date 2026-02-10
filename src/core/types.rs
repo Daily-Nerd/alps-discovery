@@ -29,6 +29,8 @@ pub enum KernelType {
     NoveltySeeking,
     /// Balances load across available hyphae.
     LoadBalancing,
+    /// Favors agents with recent successful activity.
+    TemporalRecency,
 }
 
 impl std::fmt::Display for KernelType {
@@ -37,6 +39,7 @@ impl std::fmt::Display for KernelType {
             KernelType::CapabilityMatching => write!(f, "capability_matching"),
             KernelType::NoveltySeeking => write!(f, "novelty_seeking"),
             KernelType::LoadBalancing => write!(f, "load_balancing"),
+            KernelType::TemporalRecency => write!(f, "temporal_recency"),
         }
     }
 }

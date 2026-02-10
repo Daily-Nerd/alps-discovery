@@ -166,7 +166,7 @@ pub fn compute_semantic_signature(key: &[u8], config: &LshConfig) -> [u8; SIGNAT
 fn compute_signature(key: &[u8], config: &LshConfig) -> [u8; SIGNATURE_SIZE] {
     match config.family {
         LshFamily::MinHash => {
-            let hasher = MinHasher::new(config.dimensions);
+            let hasher = MinHasher::new(config.effective_dimensions());
             hasher.hash_key(key, &config.shingle_mode)
         }
         LshFamily::RandomProjection => {
@@ -176,7 +176,7 @@ fn compute_signature(key: &[u8], config: &LshConfig) -> [u8; SIGNATURE_SIZE] {
             //
             // For byte keys, we interpret the key as a vector of u8 values
             // and project using hash-derived random vectors.
-            random_projection_signature(key, config.dimensions)
+            random_projection_signature(key, config.effective_dimensions())
         }
     }
 }
@@ -252,7 +252,7 @@ mod tests {
 
     #[test]
     fn signature_is_deterministic() {
-        let hasher = MinHasher::new(128);
+        let hasher = MinHasher::new(SIGNATURE_SIZE);
         let s1 = hasher.hash_key(b"legal translation services", &default_mode());
         let s2 = hasher.hash_key(b"legal translation services", &default_mode());
         assert_eq!(s1, s2);
@@ -260,7 +260,7 @@ mod tests {
 
     #[test]
     fn different_inputs_produce_different_signatures() {
-        let hasher = MinHasher::new(128);
+        let hasher = MinHasher::new(SIGNATURE_SIZE);
         let s1 = hasher.hash_key(b"legal translation", &default_mode());
         let s2 = hasher.hash_key(b"code review", &default_mode());
         assert_ne!(s1, s2);
@@ -268,14 +268,14 @@ mod tests {
 
     #[test]
     fn identical_inputs_have_perfect_similarity() {
-        let hasher = MinHasher::new(128);
+        let hasher = MinHasher::new(SIGNATURE_SIZE);
         let sig = hasher.hash_key(b"legal translation services", &default_mode());
         assert_eq!(MinHasher::similarity(&sig, &sig), 1.0);
     }
 
     #[test]
     fn disjoint_inputs_have_low_similarity() {
-        let hasher = MinHasher::new(128);
+        let hasher = MinHasher::new(SIGNATURE_SIZE);
         let s1 = hasher.hash_key(b"legal translation services", &default_mode());
         let s2 = hasher.hash_key(b"quantum physics experiments", &default_mode());
         let sim = MinHasher::similarity(&s1, &s2);
@@ -288,7 +288,7 @@ mod tests {
 
     #[test]
     fn similar_inputs_rank_higher_than_dissimilar() {
-        let hasher = MinHasher::new(128);
+        let hasher = MinHasher::new(SIGNATURE_SIZE);
         let query = hasher.hash_key(b"translate legal document", &default_mode());
         let similar = hasher.hash_key(b"legal translation service", &default_mode());
         let dissimilar = hasher.hash_key(b"image processing pipeline", &default_mode());
@@ -305,7 +305,7 @@ mod tests {
 
     #[test]
     fn short_key_handling() {
-        let hasher = MinHasher::new(128);
+        let hasher = MinHasher::new(SIGNATURE_SIZE);
         // Keys shorter than shingle size should not panic
         let s1 = hasher.hash_key(b"ab", &default_mode());
         let s2 = hasher.hash_key(b"a", &default_mode());
@@ -318,7 +318,7 @@ mod tests {
 
     #[test]
     fn case_insensitive_matching() {
-        let hasher = MinHasher::new(128);
+        let hasher = MinHasher::new(SIGNATURE_SIZE);
         let s1 = hasher.hash_key(b"Translate Legal Contract", &default_mode());
         let s2 = hasher.hash_key(b"translate legal contract", &default_mode());
         assert_eq!(
@@ -330,7 +330,7 @@ mod tests {
 
     #[test]
     fn word_mode_matches_shared_words() {
-        let hasher = MinHasher::new(128);
+        let hasher = MinHasher::new(SIGNATURE_SIZE);
         let mode = ShingleMode::Words;
         // These share "translate" and "legal"
         let s1 = hasher.hash_key(b"translate legal contract", &mode);
@@ -345,7 +345,7 @@ mod tests {
 
     #[test]
     fn hybrid_mode_beats_bytes_only_for_natural_language() {
-        let hasher = MinHasher::new(128);
+        let hasher = MinHasher::new(SIGNATURE_SIZE);
         let query = hasher.hash_key(b"translate legal contract", &default_mode());
         let cap = hasher.hash_key(
             b"translate text between languages with legal expertise",
@@ -396,7 +396,7 @@ mod tests {
 
     #[test]
     fn similarity_range_is_valid() {
-        let hasher = MinHasher::new(128);
+        let hasher = MinHasher::new(SIGNATURE_SIZE);
         let inputs = [
             b"legal translation".as_slice(),
             b"code review".as_slice(),
@@ -419,7 +419,7 @@ mod tests {
 
     #[test]
     fn statistical_unrelated_keys_low_average() {
-        let hasher = MinHasher::new(128);
+        let hasher = MinHasher::new(SIGNATURE_SIZE);
         let keys: Vec<&[u8]> = vec![
             b"legal translation services",
             b"quantum physics experiments",

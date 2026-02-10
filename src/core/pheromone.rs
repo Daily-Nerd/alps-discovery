@@ -22,11 +22,14 @@ pub struct HyphaState {
 }
 
 impl HyphaState {
+    /// Minimum floor for tau pheromone (prevents zero-trap absorbing state).
+    pub const TAU_FLOOR: f64 = 0.001;
+
     /// Creates a new HyphaState with the given initial diameter.
     pub fn new(initial_diameter: f64) -> Self {
         Self {
             diameter: initial_diameter,
-            tau: 0.0,
+            tau: Self::TAU_FLOOR,
             sigma: 0.0,
             omega: 0.0,
             consecutive_pulse_timeouts: 0,

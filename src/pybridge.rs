@@ -386,6 +386,14 @@ impl PyLocalNetwork {
         self.inner.record_failure(agent_name, query);
     }
 
+    /// Apply temporal decay to all agent pheromone state.
+    ///
+    /// Call periodically (e.g. once per discovery cycle or on a timer) to
+    /// prevent stale agents from retaining inflated scores indefinitely.
+    fn tick(&mut self) {
+        self.inner.tick();
+    }
+
     /// Number of registered agents.
     #[getter]
     fn agent_count(&self) -> usize {

@@ -42,10 +42,23 @@ impl Default for LshConfig {
         Self {
             similarity_threshold: 0.1,
             dissimilarity_threshold: 0.3,
-            dimensions: 128,
+            dimensions: 64,
             family: LshFamily::MinHash,
             shingle_mode: ShingleMode::Hybrid { byte_width: 3 },
         }
+    }
+}
+
+impl LshConfig {
+    /// Maximum effective dimensions (clamped to signature size).
+    pub const MAX_DIMENSIONS: usize = 64;
+
+    /// Returns the effective dimension count, clamped to signature size.
+    ///
+    /// Dimensions beyond `SIGNATURE_SIZE` (64) use a deterministic fill hash
+    /// rather than independent hash functions, which breaks MinHash independence.
+    pub fn effective_dimensions(&self) -> usize {
+        self.dimensions.min(Self::MAX_DIMENSIONS)
     }
 }
 
