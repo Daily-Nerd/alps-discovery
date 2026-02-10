@@ -30,7 +30,7 @@ Dual-language library: Rust core with Python bindings via PyO3. All discovery lo
 
 ### Testing
 - Rust unit tests co-located with implementation (`#[cfg(test)]` modules)
-- ~57 tests across LSH (13), Scorer (5), Network (39)
+- 177 tests across LSH (20), Scorer (8), Query (11), Enzyme (27), Chemistry (8), Network (77), Replay (6), and sub-modules (20)
 - Python integration via example scripts in `examples/`
 
 ## Development Environment
@@ -50,9 +50,13 @@ Dual-language library: Rust core with Python bindings via PyO3. All discovery lo
 ## Key Technical Decisions
 
 - **Self-contained core types** — all types are vendored locally for independent evolution and zero external crate dependencies beyond PyO3/serde/xxhash
-- **No `rand` dependency** — deterministic tie-breaking uses xxhash-seeded Fisher-Yates shuffle (5% threshold for randomization)
-- **Pluggable Scorer trait** — `Send + Sync` bound enables thread-safe custom scorers; Python scorers go through PyO3 bridge
-- **NetworkSnapshot persistence** — JSON format with `version` field for forward compatibility
+- **No `rand` dependency** — deterministic tie-breaking uses splitmix64-seeded Fisher-Yates shuffle with STRICT_TIE_EPSILON (1e-4) to absorb float noise
+- **Interior mutability** — `discover(&self)` is immutable via AtomicCounter + Mutex<Enzyme> + Mutex<ReplayLog> + AtomicU64 for thread-safe concurrent discovery
+- **Epsilon-greedy exploration** — ExplorationConfig (initial=0.8, floor=0.05, decay=0.99) balances exploration vs exploitation, decaying with feedback count
+- **Pluggable Scorer trait** — `Send + Sync` bound enables thread-safe custom scorers (MinHash, TfIdf built-in); Python scorers go through PyO3 bridge
+- **Banded LSH feedback** — FeedbackIndex (16 bands x 4 bytes) enables O(k) near-neighbor lookup for feedback records
+- **Replay log** — append-only event log (QuerySubmitted/AgentScored/FeedbackRecorded/TickApplied) for observability
+- **NetworkSnapshot persistence** — JSON v2 format with `version` field for forward compatibility
 - **Post-scoring metadata filters** — filtering happens after similarity scoring, not during indexing
 
 ---
