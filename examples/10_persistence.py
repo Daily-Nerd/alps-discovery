@@ -6,6 +6,7 @@ you don't need to re-register agents or lose feedback on restart.
 """
 
 import os
+
 import alps_discovery as alps
 
 STATE_FILE = "/tmp/alps_demo_state.json"
@@ -59,7 +60,7 @@ for r in results_after:
 
 # Compare
 print("\n=== Verification ===")
-for before, after in zip(results_before, results_after):
+for before, after in zip(results_before, results_after, strict=True):
     match = "MATCH" if abs(before.score - after.score) < 0.001 else "DIFF"
     print(f"  {before.agent_name}: {before.score:.4f} -> {after.score:.4f} [{match}]")
 

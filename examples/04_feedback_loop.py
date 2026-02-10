@@ -10,10 +10,8 @@ import alps_discovery as alps
 network = alps.LocalNetwork()
 
 # Two agents with identical capabilities — start equal
-network.register("agent-alpha", ["data processing", "analytics"],
-                  endpoint="http://alpha:8000")
-network.register("agent-beta", ["data processing", "analytics"],
-                  endpoint="http://beta:8000")
+network.register("agent-alpha", ["data processing", "analytics"], endpoint="http://alpha:8000")
+network.register("agent-beta", ["data processing", "analytics"], endpoint="http://beta:8000")
 
 query = "data processing pipeline"
 
@@ -24,7 +22,7 @@ for r in results:
 
 # Simulate: alpha succeeds consistently, beta fails
 print("\n=== Simulating 20 rounds: alpha succeeds, beta fails ===")
-for i in range(20):
+for _i in range(20):
     network.record_success("agent-alpha")
     network.record_failure("agent-beta")
 
@@ -38,7 +36,7 @@ print(f"\n  Alpha/Beta score ratio: {alpha.score / beta.score:.1f}x")
 
 # Can beta recover?
 print("\n=== Recovery: beta succeeds 40 rounds ===")
-for i in range(40):
+for _i in range(40):
     network.record_success("agent-beta")
 
 results = network.discover(query)
@@ -53,16 +51,16 @@ print("\n  Note: diameter clamps to [0.1, 1.0], so agents converge")
 print("  toward 1.0 after enough successes. Prevents runaway.")
 
 # ---------------------------------------------------------------------------
-print(f"\n{'='*60}")
+print(f"\n{'=' * 60}")
 print("  PER-QUERY FEEDBACK")
-print(f"{'='*60}\n")
+print(f"{'=' * 60}\n")
 # ---------------------------------------------------------------------------
 
 network2 = alps.LocalNetwork()
-network2.register("multi-agent", ["translation", "summarization"],
-                   endpoint="http://multi:8000")
-network2.register("translate-only", ["translation", "legal translation"],
-                   endpoint="http://translate:8000")
+network2.register("multi-agent", ["translation", "summarization"], endpoint="http://multi:8000")
+network2.register(
+    "translate-only", ["translation", "legal translation"], endpoint="http://translate:8000"
+)
 
 translate_q = "translate legal contract"
 summarize_q = "summarize a document"

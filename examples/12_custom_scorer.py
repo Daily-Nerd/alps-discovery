@@ -14,8 +14,8 @@ feedback, tie-breaking, filtering).
 
 import alps_discovery as alps
 
-
 # --- Example 1: Keyword scorer (simple, no dependencies) ---
+
 
 class KeywordScorer:
     """Scores agents by counting keyword overlaps.
@@ -53,12 +53,19 @@ class KeywordScorer:
 print("=== KeywordScorer (word overlap) ===\n")
 network = alps.LocalNetwork(scorer=KeywordScorer())
 
-network.register("translate-agent", ["legal translation EN-DE EN-FR"],
-                  endpoint="http://localhost:8080/translate")
-network.register("summarize-agent", ["document summarization legal briefs"],
-                  endpoint="http://localhost:9090/summarize")
-network.register("classify-agent", ["document classification contract type"],
-                  endpoint="http://localhost:7070/classify")
+network.register(
+    "translate-agent", ["legal translation EN-DE EN-FR"], endpoint="http://localhost:8080/translate"
+)
+network.register(
+    "summarize-agent",
+    ["document summarization legal briefs"],
+    endpoint="http://localhost:9090/summarize",
+)
+network.register(
+    "classify-agent",
+    ["document classification contract type"],
+    endpoint="http://localhost:7070/classify",
+)
 
 queries = [
     "legal translation",

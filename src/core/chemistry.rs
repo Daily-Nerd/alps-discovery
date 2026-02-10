@@ -102,3 +102,107 @@ impl Default for Chemistry {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chemistry_new_starts_all_0xff() {
+        let chem = Chemistry::new();
+        assert_eq!(chem.signature, [0xFF; 64]);
+        assert_eq!(chem.signal_count, 0);
+    }
+
+    #[test]
+    fn query_signature_default_is_all_0xff() {
+        let qs = QuerySignature::default();
+        assert_eq!(qs.minhash, [0xFF; 64]);
+    }
+
+    #[test]
+    fn deposit_takes_element_wise_minimum() {
+        let mut chem = Chemistry::new();
+        // Fresh chemistry is all 0xFF. Deposit a signature where the first
+        // 32 bytes are 0x10 and the rest are 0xFF.
+        let mut sig = [0xFF; 64];
+        sig[..32].fill(0x10);
+        chem.deposit(&sig);
+
+        // First 32 bytes should now be min(0xFF, 0x10) = 0x10
+        for i in 0..32 {
+            assert_eq!(chem.signature[i], 0x10, "byte {} should be 0x10", i);
+        }
+        // Remaining 32 bytes should still be min(0xFF, 0xFF) = 0xFF
+        for i in 32..64 {
+            assert_eq!(chem.signature[i], 0xFF, "byte {} should be 0xFF", i);
+        }
+    }
+
+    #[test]
+    fn deposit_increments_signal_count() {
+        let mut chem = Chemistry::new();
+        let sig = [0x42; 64];
+        chem.deposit(&sig);
+        chem.deposit(&sig);
+        assert_eq!(chem.signal_count, 2);
+    }
+
+    #[test]
+    fn similarity_identical_signatures_returns_1() {
+        let mut chem = Chemistry::new();
+        let sig = [0x42; 64];
+        chem.deposit(&sig);
+
+        let query = QuerySignature::new([0x42; 64]);
+        let sim = chem.similarity(&query);
+        assert!(
+            (sim - 1.0).abs() < f64::EPSILON,
+            "expected 1.0, got {}",
+            sim
+        );
+    }
+
+    #[test]
+    fn similarity_completely_different_returns_0() {
+        // Build a chemistry where every byte is 0x00 (minimum possible).
+        let mut chem = Chemistry::new();
+        chem.deposit(&[0x00; 64]);
+        // Query where every byte is 0xFF — no position matches 0x00.
+        let query = QuerySignature::new([0xFF; 64]);
+        let sim = chem.similarity(&query);
+        assert!(sim.abs() < f64::EPSILON, "expected 0.0, got {}", sim);
+    }
+
+    #[test]
+    fn similarity_partial_match() {
+        // Build a chemistry: first 32 bytes = 0xAA, last 32 bytes = 0xBB.
+        let mut chem = Chemistry::new();
+        let mut sig = [0xBB; 64];
+        sig[..32].fill(0xAA);
+        chem.deposit(&sig);
+
+        // Query: first 32 bytes = 0xAA (match), last 32 bytes = 0xCC (no match).
+        let mut q = [0xCC; 64];
+        q[..32].fill(0xAA);
+        let query = QuerySignature::new(q);
+        let sim = chem.similarity(&query);
+        assert!(
+            (sim - 0.5).abs() < f64::EPSILON,
+            "expected 0.5, got {}",
+            sim
+        );
+    }
+
+    #[test]
+    fn similarity_fresh_chemistry_vs_fresh_query() {
+        let chem = Chemistry::new(); // all 0xFF
+        let query = QuerySignature::default(); // all 0xFF
+        let sim = chem.similarity(&query);
+        assert!(
+            (sim - 1.0).abs() < f64::EPSILON,
+            "expected 1.0, got {}",
+            sim
+        );
+    }
+}

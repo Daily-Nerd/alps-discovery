@@ -1,6 +1,6 @@
 """Type stubs for alps_discovery._native (Rust extension module)."""
 
-from typing import Any, Optional
+from typing import Any
 
 class LocalNetwork:
     """Local agent discovery network using multi-kernel routing.
@@ -17,7 +17,6 @@ class LocalNetwork:
         similarity_threshold: float | None = None,
         scorer: Any | None = None,
     ) -> None: ...
-
     def register(
         self,
         name: str,
@@ -48,7 +47,7 @@ class LocalNetwork:
         *,
         filters: dict[str, Any] | None = None,
         explain: bool = False,
-    ) -> list["DiscoveryResult"] | list["ExplainedResult"]:
+    ) -> list[DiscoveryResult] | list[ExplainedResult]:
         """Discover agents matching a query.
 
         Args:
@@ -60,6 +59,28 @@ class LocalNetwork:
 
         Returns:
             Ranked list of results, best match first.
+        """
+        ...
+
+    def discover_many(
+        self,
+        queries: list[str],
+        *,
+        filters: dict[str, Any] | None = None,
+        explain: bool = False,
+    ) -> list[list[DiscoveryResult]] | list[list[ExplainedResult]]:
+        """Discover agents for multiple queries in a single call.
+
+        Returns one result list per query, in input order. Moves the
+        query loop from Python to Rust for better performance.
+
+        Args:
+            queries: List of natural-language capability queries.
+            filters: Optional metadata filters (shared across all queries).
+            explain: If True, returns ExplainedResult with scoring breakdown.
+
+        Returns:
+            List of ranked result lists, one per query.
         """
         ...
 
@@ -85,10 +106,9 @@ class LocalNetwork:
         ...
 
     @staticmethod
-    def load(path: str) -> "LocalNetwork":
+    def load(path: str) -> LocalNetwork:
         """Load network state from a JSON file."""
         ...
-
 
 class DiscoveryResult:
     """A single discovery result.
@@ -101,13 +121,13 @@ class DiscoveryResult:
         metadata: Dict of key-value pairs if provided, else {}.
         invoke: Callable if provided at registration, else None.
     """
+
     agent_name: str
     similarity: float
     score: float
     endpoint: str | None
     metadata: dict[str, str]
     invoke: Any | None
-
 
 class ExplainedResult:
     """Extended discovery result with full scoring breakdown.
@@ -121,6 +141,7 @@ class ExplainedResult:
         endpoint: Agent URI/URL if provided at registration, else None.
         metadata: Dict of key-value pairs if provided, else {}.
     """
+
     agent_name: str
     raw_similarity: float
     diameter: float

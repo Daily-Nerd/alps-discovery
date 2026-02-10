@@ -25,7 +25,7 @@ pub trait Scorer: Send + Sync {
     ///
     /// Returns `(agent_id, similarity)` pairs for agents with similarity > 0.
     /// The caller applies threshold filtering, diameter adjustment, and feedback.
-    fn score(&self, query: &str) -> Vec<(String, f64)>;
+    fn score(&self, query: &str) -> Result<Vec<(String, f64)>, String>;
 }
 
 /// MinHash-based scorer using locality-sensitive hashing.
@@ -73,9 +73,10 @@ impl Scorer for MinHashScorer {
         self.agents.remove(agent_id);
     }
 
-    fn score(&self, query: &str) -> Vec<(String, f64)> {
+    fn score(&self, query: &str) -> Result<Vec<(String, f64)>, String> {
         let query_sig = compute_query_signature(query.as_bytes(), &self.config);
-        self.agents
+        Ok(self
+            .agents
             .iter()
             .map(|(agent_id, cap_sigs)| {
                 let sim = cap_sigs
@@ -85,7 +86,7 @@ impl Scorer for MinHashScorer {
                 (agent_id.clone(), sim)
             })
             .filter(|(_, sim)| *sim > 0.0)
-            .collect()
+            .collect())
     }
 }
 
@@ -97,7 +98,7 @@ mod tests {
     fn minhash_scorer_index_and_score() {
         let mut scorer = MinHashScorer::default();
         scorer.index_capabilities("agent-a", &["legal translation", "EN-DE"]);
-        let results = scorer.score("legal translation");
+        let results = scorer.score("legal translation").unwrap();
         assert!(!results.is_empty());
         let (name, sim) = &results[0];
         assert_eq!(name, "agent-a");
@@ -109,7 +110,7 @@ mod tests {
         let mut scorer = MinHashScorer::default();
         scorer.index_capabilities("agent-a", &["legal translation"]);
         scorer.remove_agent("agent-a");
-        let results = scorer.score("legal translation");
+        let results = scorer.score("legal translation").unwrap();
         assert!(results.is_empty());
     }
 
@@ -118,7 +119,7 @@ mod tests {
         let mut scorer = MinHashScorer::default();
         scorer.index_capabilities("translate", &["legal translation services"]);
         scorer.index_capabilities("summarize", &["document summarization"]);
-        let results = scorer.score("legal translation");
+        let results = scorer.score("legal translation").unwrap();
         assert!(!results.is_empty());
         // translate should have higher similarity for "legal translation"
         let translate_sim = results
@@ -142,7 +143,7 @@ mod tests {
     #[test]
     fn minhash_scorer_empty_returns_empty() {
         let scorer = MinHashScorer::default();
-        let results = scorer.score("anything");
+        let results = scorer.score("anything").unwrap();
         assert!(results.is_empty());
     }
 
@@ -152,7 +153,7 @@ mod tests {
         scorer.index_capabilities("agent-a", &["legal translation"]);
         scorer.index_capabilities("agent-a", &["data processing"]);
         // After reindex, should match "data processing" not "legal translation" as well
-        let results = scorer.score("data processing");
+        let results = scorer.score("data processing").unwrap();
         assert!(!results.is_empty());
         assert_eq!(results[0].0, "agent-a");
     }

@@ -45,9 +45,9 @@ queries = [
     "translate legal contract",
     "translate medical records",
     # Hard: semantic but not lexical
-    "convert contract to German",         # means translation but doesn't say "translate"
-    "review my pull request",             # means code review but different words
-    "make this document shorter",         # means summarization but doesn't say it
+    "convert contract to German",  # means translation but doesn't say "translate"
+    "review my pull request",  # means code review but different words
+    "make this document shorter",  # means summarization but doesn't say it
     # Edge: very short queries
     "translate",
     "legal",
@@ -62,12 +62,18 @@ for q in queries:
 
     top = results[0]
     runner_up = results[1] if len(results) > 1 else None
-    margin = (top.similarity - runner_up.similarity) / top.similarity * 100 if runner_up and top.similarity > 0 else 100
+    margin = (
+        (top.similarity - runner_up.similarity) / top.similarity * 100
+        if runner_up and top.similarity > 0
+        else 100
+    )
 
     print(f"  '{q}'")
     print(f"    #1: {top.agent_name} (sim={top.similarity:.3f})")
     if runner_up:
-        print(f"    #2: {runner_up.agent_name} (sim={runner_up.similarity:.3f}) margin={margin:.0f}%")
+        print(
+            f"    #2: {runner_up.agent_name} (sim={runner_up.similarity:.3f}) margin={margin:.0f}%"
+        )
     print()
 
 print("=== Key observations ===")

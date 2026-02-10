@@ -13,7 +13,7 @@ Usage:
 """
 
 try:
-    from ._native import LocalNetwork, DiscoveryResult, ExplainedResult
+    from ._native import DiscoveryResult, ExplainedResult, LocalNetwork
 except ImportError as e:
     raise ImportError(
         "Failed to import alps_discovery native module. "
@@ -59,7 +59,7 @@ def capabilities_from_mcp(tools: list[dict]) -> list[str]:
         # Extract parameter names (lean nouns, not verbose descriptions)
         schema = tool.get("inputSchema", {})
         props = schema.get("properties", {})
-        param_names = [p.replace("_", " ") for p in props.keys()]
+        param_names = [p.replace("_", " ") for p in props]
         if param_names:
             parts.append(", ".join(param_names))
 
@@ -70,4 +70,4 @@ def capabilities_from_mcp(tools: list[dict]) -> list[str]:
     return caps
 
 
-__all__ = ["LocalNetwork", "DiscoveryResult", "ExplainedResult", "capabilities_from_mcp"]
+__all__ = ["DiscoveryResult", "ExplainedResult", "LocalNetwork", "capabilities_from_mcp"]

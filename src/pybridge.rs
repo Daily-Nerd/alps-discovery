@@ -55,22 +55,13 @@ impl Scorer for PyScorer {
         });
     }
 
-    fn score(&self, query: &str) -> Vec<(String, f64)> {
+    fn score(&self, query: &str) -> Result<Vec<(String, f64)>, String> {
         Python::attach(|py| match self.inner.call_method1(py, "score", (query,)) {
             Ok(result) => match result.extract::<Vec<(String, f64)>>(py) {
-                Ok(scores) => scores,
-                Err(e) => {
-                    eprintln!(
-                        "alps-discovery: scorer.score() returned invalid type: {}",
-                        e
-                    );
-                    Vec::new()
-                }
+                Ok(scores) => Ok(scores),
+                Err(e) => Err(format!("scorer.score() returned invalid type: {}", e)),
             },
-            Err(e) => {
-                eprintln!("alps-discovery: scorer.score() failed: {}", e);
-                Vec::new()
-            }
+            Err(e) => Err(format!("scorer.score() failed: {}", e)),
         })
     }
 }
@@ -240,6 +231,84 @@ impl PyLocalNetwork {
         }
     }
 
+    /// Discover agents for multiple queries in a single call.
+    ///
+    /// Returns a list of result lists, one per query. Moves the query loop
+    /// from Python to Rust for better performance (avoids per-query GIL overhead).
+    ///
+    /// Args:
+    ///     queries: List of natural-language capability queries.
+    ///     filters: Optional metadata filters (shared across all queries).
+    ///     explain: If True, return ExplainedResult with scoring breakdown.
+    #[pyo3(signature = (queries, *, filters=None, explain=false))]
+    fn discover_many(
+        &mut self,
+        py: Python<'_>,
+        queries: Vec<String>,
+        filters: Option<HashMap<String, Py<PyAny>>>,
+        explain: bool,
+    ) -> PyResult<Py<PyAny>> {
+        let rust_filters = if let Some(py_filters) = filters {
+            let mut f = crate::network::Filters::new();
+            for (key, value) in py_filters {
+                let filter_value = Self::parse_filter_value(py, &value)?;
+                f.insert(key, filter_value);
+            }
+            Some(f)
+        } else {
+            None
+        };
+
+        let query_refs: Vec<&str> = queries.iter().map(|s| s.as_str()).collect();
+
+        if explain {
+            let batch: Vec<Vec<PyExplainedResult>> = self
+                .inner
+                .discover_many_explained(&query_refs, rust_filters.as_ref())
+                .into_iter()
+                .map(|results| {
+                    results
+                        .into_iter()
+                        .map(|r| PyExplainedResult {
+                            agent_name: r.agent_name,
+                            raw_similarity: r.raw_similarity,
+                            diameter: r.diameter,
+                            feedback_factor: r.feedback_factor,
+                            final_score: r.final_score,
+                            endpoint: r.endpoint,
+                            metadata: r.metadata,
+                        })
+                        .collect()
+                })
+                .collect();
+            Ok(batch.into_pyobject(py)?.into_any().unbind())
+        } else {
+            let batch: Vec<Vec<PyDiscoveryResult>> = self
+                .inner
+                .discover_many(&query_refs, rust_filters.as_ref())
+                .into_iter()
+                .map(|results| {
+                    results
+                        .into_iter()
+                        .map(|r| {
+                            let invoke =
+                                self.invocables.get(&r.agent_name).map(|f| f.clone_ref(py));
+                            PyDiscoveryResult {
+                                agent_name: r.agent_name,
+                                similarity: r.similarity,
+                                score: r.score,
+                                endpoint: r.endpoint,
+                                metadata: r.metadata,
+                                invoke,
+                            }
+                        })
+                        .collect()
+                })
+                .collect();
+            Ok(batch.into_pyobject(py)?.into_any().unbind())
+        }
+    }
+
     /// Record a successful interaction with an agent.
     ///
     /// If `query` is provided, future queries similar to it will boost
@@ -285,7 +354,7 @@ impl PyLocalNetwork {
     fn save(&self, path: &str) -> PyResult<()> {
         self.inner
             .save(path)
-            .map_err(pyo3::exceptions::PyIOError::new_err)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))
     }
 
     /// Load network state from a previously saved JSON file.
@@ -297,7 +366,8 @@ impl PyLocalNetwork {
     ///     path: File path to load from (e.g. "state.json").
     #[staticmethod]
     fn load(path: &str) -> PyResult<Self> {
-        let inner = LocalNetwork::load(path).map_err(pyo3::exceptions::PyIOError::new_err)?;
+        let inner = LocalNetwork::load(path)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
         Ok(Self {
             inner,
             invocables: HashMap::new(),

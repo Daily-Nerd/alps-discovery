@@ -66,6 +66,6 @@ print("=== Consistency check: explain scores match regular discover ===\n")
 explained = network.discover("translate legal contract", explain=True)
 regular = network.discover("translate legal contract")
 
-for e, r in zip(explained, regular):
+for e, r in zip(explained, regular, strict=True):
     match = "OK" if abs(e.final_score - r.score) < 0.001 else "MISMATCH"
     print(f"  {e.agent_name}: explain={e.final_score:.4f}, regular={r.score:.4f} [{match}]")

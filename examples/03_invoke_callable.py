@@ -41,7 +41,9 @@ print(f"Query: '{query}'")
 print(f"Best match: {results[0].agent_name} (similarity={results[0].similarity:.3f})")
 
 if results[0].invoke:
-    output = results[0].invoke({"text": "Vertragsbedingungen und Haftungsausschluss", "target_lang": "EN"})
+    output = results[0].invoke(
+        {"text": "Vertragsbedingungen und Haftungsausschluss", "target_lang": "EN"}
+    )
     print(f"Output: {output}")
     network.record_success(results[0].agent_name)
 else:
@@ -55,5 +57,7 @@ print(f"Query: '{query}'")
 print(f"Best match: {results[0].agent_name} (similarity={results[0].similarity:.3f})")
 
 if results[0].invoke:
-    output = results[0].invoke({"text": "This agreement constitutes the entire understanding between the parties..."})
+    output = results[0].invoke(
+        {"text": "This agreement constitutes the entire understanding between the parties..."}
+    )
     print(f"Output: {output}")

@@ -17,8 +17,14 @@ translate_tools = [
             "type": "object",
             "properties": {
                 "text": {"type": "string", "description": "Source text to translate"},
-                "source_lang": {"type": "string", "description": "Source language code like EN, DE, FR"},
-                "target_lang": {"type": "string", "description": "Target language code like EN, DE, FR"},
+                "source_lang": {
+                    "type": "string",
+                    "description": "Source language code like EN, DE, FR",
+                },
+                "target_lang": {
+                    "type": "string",
+                    "description": "Target language code like EN, DE, FR",
+                },
             },
         },
     },
@@ -110,6 +116,7 @@ print()
 translate_query = "translate legal contract to German"
 detect_query = "detect language of this text"
 
+
 # Snapshot scores before feedback.
 def score_for(results, agent_name):
     for r in results:
@@ -117,10 +124,11 @@ def score_for(results, agent_name):
             return r.score
     return None
 
+
 trans_score_before = score_for(network.discover(translate_query), "translate-mcp-server")
 detect_score_before = score_for(network.discover(detect_query), "translate-mcp-server")
 
-print(f"Before feedback (translate-mcp-server scores):")
+print("Before feedback (translate-mcp-server scores):")
 print(f"  '{translate_query}' -> score={trans_score_before:.4f}")
 print(f"  '{detect_query}'       -> score={detect_score_before:.4f}")
 print()
@@ -133,7 +141,7 @@ for _ in range(10):
 trans_score_after = score_for(network.discover(translate_query), "translate-mcp-server")
 detect_score_after = score_for(network.discover(detect_query), "translate-mcp-server")
 
-print(f"After 10 translation successes (with query context):")
+print("After 10 translation successes (with query context):")
 print(f"  '{translate_query}' -> score={trans_score_after:.4f}")
 print(f"  '{detect_query}'       -> score={detect_score_after:.4f}")
 print()

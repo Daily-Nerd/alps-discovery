@@ -6,3 +6,9 @@ repos:
         args: ["--all", "--", "--check"]
       - id: clippy
         args: ["--all-targets", "--all-features", "--", "-D", "warnings"]
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.9.6
+    hooks:
+      - id: ruff
+        args: ["--fix"]
+      - id: ruff-format

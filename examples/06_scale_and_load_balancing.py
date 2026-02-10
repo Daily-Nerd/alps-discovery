@@ -5,20 +5,27 @@ score within 5% of the top score, randomized tie-breaking shuffles
 them so traffic distributes naturally — no external load balancer needed.
 """
 
-import alps_discovery as alps
 from collections import Counter
+
+import alps_discovery as alps
 
 network = alps.LocalNetwork()
 
 # Register 20 translation agents with identical capabilities
 for i in range(20):
-    network.register(f"translate-{i:02d}", ["legal translation", "EN-DE"],
-                      endpoint=f"http://translate-{i:02d}:8000")
+    network.register(
+        f"translate-{i:02d}",
+        ["legal translation", "EN-DE"],
+        endpoint=f"http://translate-{i:02d}:8000",
+    )
 
 # Register 5 summarization agents
 for i in range(5):
-    network.register(f"summarize-{i:02d}", ["document summarization", "legal briefs"],
-                      endpoint=f"http://summarize-{i:02d}:8000")
+    network.register(
+        f"summarize-{i:02d}",
+        ["document summarization", "legal briefs"],
+        endpoint=f"http://summarize-{i:02d}:8000",
+    )
 
 print(f"Registered {network.agent_count} agents\n")
 

@@ -89,7 +89,9 @@ results = network.discover(
     filters={"protocol": "mcp", "latency_ms": {"$lt": 100.0}},
 )
 for r in results:
-    print(f"  {r.agent_name} (sim={r.similarity:.3f}) proto={r.metadata.get('protocol')} lat={r.metadata.get('latency_ms')}ms")
+    proto = r.metadata.get("protocol")
+    lat = r.metadata.get("latency_ms")
+    print(f"  {r.agent_name} (sim={r.similarity:.3f}) proto={proto} lat={lat}ms")
 print()
 
 # --- No matches ---

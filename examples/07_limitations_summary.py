@@ -9,9 +9,9 @@ import alps_discovery as alps
 
 
 def section(title):
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"  {title}")
-    print(f"{'='*60}\n")
+    print(f"{'=' * 60}\n")
 
 
 # ---------------------------------------------------------------------------
@@ -19,10 +19,10 @@ section("1. LEXICAL MATCHING — no semantic understanding")
 # ---------------------------------------------------------------------------
 
 network = alps.LocalNetwork()
-network.register("translator", ["language translation services"],
-                  endpoint="http://translator:8000")
-network.register("localizer", ["localization and internationalization"],
-                  endpoint="http://localizer:8000")
+network.register("translator", ["language translation services"], endpoint="http://translator:8000")
+network.register(
+    "localizer", ["localization and internationalization"], endpoint="http://localizer:8000"
+)
 
 for query in ["translate document", "localize content", "convert to another language"]:
     results = network.discover(query)
@@ -42,8 +42,7 @@ section("2. SHORT STRINGS — limited n-gram surface")
 
 network = alps.LocalNetwork()
 network.register("agent-a", ["NLP"], endpoint="http://a:8000")
-network.register("agent-b", ["natural language processing"],
-                  endpoint="http://b:8000")
+network.register("agent-b", ["natural language processing"], endpoint="http://b:8000")
 
 for query in ["NLP", "natural language processing", "text analysis"]:
     results = network.discover(query)
@@ -60,8 +59,7 @@ section("3. ACRONYMS AND ABBREVIATIONS — no expansion")
 # ---------------------------------------------------------------------------
 
 network = alps.LocalNetwork()
-network.register("ml-agent", ["machine learning model training"],
-                  endpoint="http://ml:8000")
+network.register("ml-agent", ["machine learning model training"], endpoint="http://ml:8000")
 
 for query in ["ML training", "machine learning", "train a model"]:
     results = network.discover(query)

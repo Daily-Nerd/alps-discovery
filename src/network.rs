@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_big_array::BigArray;
 
+use thiserror::Error;
+
 use crate::core::chemistry::Chemistry;
 use crate::core::config::{LshConfig, SporeConfig};
 use crate::core::enzyme::{Enzyme, SLNEnzyme, SLNEnzymeConfig};
@@ -24,6 +26,20 @@ use crate::core::types::{HyphaId, PeerAddr, TrailId};
 use crate::core::action::EnzymeAction;
 use crate::core::config::QueryConfig;
 use crate::scorer::{MinHashScorer, Scorer};
+
+/// Structured error type for network persistence operations.
+#[derive(Debug, Error)]
+pub enum NetworkError {
+    /// JSON serialization/deserialization failure.
+    #[error("serialization error: {0}")]
+    Serialization(#[from] serde_json::Error),
+    /// File system I/O failure.
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    /// Snapshot version is newer than what this library supports.
+    #[error("unsupported snapshot version {found} (supported up to {supported})")]
+    UnsupportedVersion { found: u32, supported: u32 },
+}
 
 /// A single discovery result with scoring breakdown.
 #[derive(Debug, Clone)]
@@ -68,6 +84,18 @@ struct ScoredCandidate {
     final_score: f64,
     endpoint: Option<String>,
     metadata: HashMap<String, String>,
+}
+
+/// Lightweight candidate with borrowed fields for the pre-filter scoring phase.
+/// Only survivors get promoted to owned ScoredCandidate.
+struct CandidateRef<'a> {
+    agent_name: &'a str,
+    raw_similarity: f64,
+    diameter: f64,
+    feedback_factor: f64,
+    final_score: f64,
+    endpoint: &'a Option<String>,
+    metadata: &'a HashMap<String, String>,
 }
 
 /// Maximum number of feedback records stored per agent.
@@ -359,6 +387,39 @@ impl LocalNetwork {
             .collect()
     }
 
+    /// Discover agents for multiple queries in a single call.
+    ///
+    /// Returns one result list per query, in the same order as the input.
+    /// Filters are shared across all queries. Each query runs through
+    /// the full discovery pipeline (scoring, feedback, tie-breaking, enzyme update).
+    ///
+    /// This moves the query loop from Python to Rust, avoiding per-query
+    /// GIL acquisition overhead. Future versions may parallelize internally.
+    pub fn discover_many(
+        &mut self,
+        queries: &[&str],
+        filters: Option<&Filters>,
+    ) -> Vec<Vec<DiscoveryResult>> {
+        queries
+            .iter()
+            .map(|q| self.discover_filtered(q, filters))
+            .collect()
+    }
+
+    /// Discover agents for multiple queries with full scoring breakdown.
+    ///
+    /// Like `discover_many` but returns `ExplainedResult` per match.
+    pub fn discover_many_explained(
+        &mut self,
+        queries: &[&str],
+        filters: Option<&Filters>,
+    ) -> Vec<Vec<ExplainedResult>> {
+        queries
+            .iter()
+            .map(|q| self.discover_explained(q, filters))
+            .collect()
+    }
+
     /// Shared discovery pipeline: scoring, feedback, tie-breaking, filtering, enzyme update.
     fn discover_core(&mut self, query: &str, filters: Option<&Filters>) -> Vec<ScoredCandidate> {
         if self.agents.is_empty() {
@@ -368,15 +429,21 @@ impl LocalNetwork {
         let query_sig = compute_query_signature(query.as_bytes(), &self.lsh_config);
 
         // Get raw scores from the scorer.
-        let raw_scores = self.scorer.score(query);
+        let raw_scores = match self.scorer.score(query) {
+            Ok(scores) => scores,
+            Err(e) => {
+                eprintln!("alps-discovery: scorer.score() error: {}", e);
+                return Vec::new();
+            }
+        };
         let score_map: HashMap<String, f64> = raw_scores.into_iter().collect();
 
-        // Build results with diameter and feedback adjustments.
-        let mut results: Vec<ScoredCandidate> = self
+        // Build lightweight references — no cloning yet.
+        let mut refs: Vec<CandidateRef<'_>> = self
             .agents
             .iter()
             .filter_map(|(name, record)| {
-                let sim = score_map.get(name).copied().unwrap_or(0.0);
+                let sim = score_map.get(name.as_str()).copied().unwrap_or(0.0);
                 if sim < self.lsh_config.similarity_threshold {
                     return None;
                 }
@@ -390,34 +457,45 @@ impl LocalNetwork {
                     record.hypha.state.diameter * (1.0 + feedback_factor * FEEDBACK_STRENGTH);
 
                 let score = sim * adjusted_diameter;
-                Some(ScoredCandidate {
-                    agent_name: name.clone(),
+                Some(CandidateRef {
+                    agent_name: name.as_str(),
                     raw_similarity: sim,
                     diameter: record.hypha.state.diameter,
                     feedback_factor,
                     final_score: score,
-                    endpoint: record.endpoint.clone(),
-                    metadata: record.metadata.clone(),
+                    endpoint: &record.endpoint,
+                    metadata: &record.metadata,
                 })
             })
             .collect();
 
-        results.sort_by(|a, b| {
+        // Apply metadata filters before sorting (avoids sorting filtered-out items).
+        if let Some(filters) = filters {
+            refs.retain(|r| {
+                filters
+                    .iter()
+                    .all(|(key, filter)| match r.metadata.get(key) {
+                        Some(value) => filter.matches(value),
+                        None => false,
+                    })
+            });
+        }
+
+        refs.sort_by(|a, b| {
             b.final_score
                 .partial_cmp(&a.final_score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
         // Randomized tie-breaking: shuffle agents within 5% of top score.
-        if results.len() > 1 {
-            let top_score = results[0].final_score;
+        if refs.len() > 1 {
+            let top_score = refs[0].final_score;
             let tie_threshold = top_score * 0.95;
-            let tie_count = results
+            let tie_count = refs
                 .iter()
                 .take_while(|r| r.final_score >= tie_threshold)
                 .count();
             if tie_count > 1 {
-                // Deterministic-ish shuffle using xxhash seeded by query + system time.
                 use std::time::SystemTime;
                 use xxhash_rust::xxh3::xxh3_64_with_seed;
                 let time_seed = SystemTime::now()
@@ -426,8 +504,7 @@ impl LocalNetwork {
                     .unwrap_or(0);
                 let base_seed = xxh3_64_with_seed(query.as_bytes(), time_seed);
 
-                // Fisher-Yates shuffle on the tie group.
-                let tie_slice = &mut results[..tie_count];
+                let tie_slice = &mut refs[..tie_count];
                 for i in (1..tie_slice.len()).rev() {
                     let j_seed = base_seed.wrapping_add(i as u64);
                     let j = (xxh3_64_with_seed(&i.to_le_bytes(), j_seed) as usize) % (i + 1);
@@ -436,17 +513,19 @@ impl LocalNetwork {
             }
         }
 
-        // Apply metadata filters (post-scoring).
-        if let Some(filters) = filters {
-            results.retain(|r| {
-                filters
-                    .iter()
-                    .all(|(key, filter)| match r.metadata.get(key) {
-                        Some(value) => filter.matches(value),
-                        None => false, // Missing key = filter fails (strict)
-                    })
-            });
-        }
+        // Promote survivors to owned ScoredCandidate (clone only here).
+        let results: Vec<ScoredCandidate> = refs
+            .into_iter()
+            .map(|r| ScoredCandidate {
+                agent_name: r.agent_name.to_string(),
+                raw_similarity: r.raw_similarity,
+                diameter: r.diameter,
+                feedback_factor: r.feedback_factor,
+                final_score: r.final_score,
+                endpoint: r.endpoint.clone(),
+                metadata: r.metadata.clone(),
+            })
+            .collect();
 
         // Run the enzyme to update internal state (feeds LoadBalancingKernel).
         let signal = Signal::Tendril(Tendril {
@@ -596,7 +675,7 @@ impl LocalNetwork {
     ///
     /// `Hypha.last_activity` (an `Instant`) is NOT serialized — it resets
     /// to `Instant::now()` on load.
-    pub fn save(&self, path: &str) -> Result<(), String> {
+    pub fn save(&self, path: &str) -> Result<(), NetworkError> {
         let snapshot = NetworkSnapshot {
             version: Self::SNAPSHOT_VERSION,
             agents: self
@@ -627,8 +706,9 @@ impl LocalNetwork {
                 })
                 .collect(),
         };
-        let json = serde_json::to_string_pretty(&snapshot).map_err(|e| e.to_string())?;
-        std::fs::write(path, json).map_err(|e| e.to_string())
+        let json = serde_json::to_string_pretty(&snapshot)?;
+        std::fs::write(path, json)?;
+        Ok(())
     }
 
     /// Load network state from a JSON file.
@@ -641,16 +721,15 @@ impl LocalNetwork {
     /// Current snapshot schema version.
     const SNAPSHOT_VERSION: u32 = 1;
 
-    pub fn load(path: &str) -> Result<Self, String> {
-        let json = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-        let snapshot: NetworkSnapshot = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+    pub fn load(path: &str) -> Result<Self, NetworkError> {
+        let json = std::fs::read_to_string(path)?;
+        let snapshot: NetworkSnapshot = serde_json::from_str(&json)?;
 
         if snapshot.version > Self::SNAPSHOT_VERSION {
-            return Err(format!(
-                "snapshot version {} is newer than supported version {}; upgrade alps-discovery",
-                snapshot.version,
-                Self::SNAPSHOT_VERSION
-            ));
+            return Err(NetworkError::UnsupportedVersion {
+                found: snapshot.version,
+                supported: Self::SNAPSHOT_VERSION,
+            });
         }
 
         let mut network = Self::new();
@@ -1086,8 +1165,8 @@ mod tests {
             fn remove_agent(&mut self, agent_id: &str) {
                 self.scores.remove(agent_id);
             }
-            fn score(&self, _query: &str) -> Vec<(String, f64)> {
-                self.scores.iter().map(|(k, v)| (k.clone(), *v)).collect()
+            fn score(&self, _query: &str) -> Result<Vec<(String, f64)>, String> {
+                Ok(self.scores.iter().map(|(k, v)| (k.clone(), *v)).collect())
             }
         }
 
@@ -1115,11 +1194,11 @@ mod tests {
         impl Scorer for RankedMockScorer {
             fn index_capabilities(&mut self, _agent_id: &str, _capabilities: &[&str]) {}
             fn remove_agent(&mut self, _agent_id: &str) {}
-            fn score(&self, _query: &str) -> Vec<(String, f64)> {
-                vec![
+            fn score(&self, _query: &str) -> Result<Vec<(String, f64)>, String> {
+                Ok(vec![
                     ("agent-high".to_string(), 0.9),
                     ("agent-low".to_string(), 0.3),
-                ]
+                ])
             }
         }
 
@@ -1455,8 +1534,14 @@ mod tests {
         assert!(result.is_err());
         let err = result.err().unwrap();
         assert!(
-            err.contains("newer than supported"),
-            "error should mention version mismatch: {}",
+            matches!(
+                err,
+                NetworkError::UnsupportedVersion {
+                    found: 99,
+                    supported: 1
+                }
+            ),
+            "expected UnsupportedVersion, got: {:?}",
             err
         );
         let _ = std::fs::remove_file(path);
@@ -1582,5 +1667,85 @@ mod tests {
             "feedback_factor should be ~0 without feedback, got {:.4}",
             results[0].feedback_factor
         );
+    }
+
+    #[test]
+    fn discover_many_returns_per_query_results() {
+        let mut network = LocalNetwork::new();
+        reg(
+            &mut network,
+            "translate-agent",
+            &["legal translation services"],
+        );
+        reg(&mut network, "summarize-agent", &["document summarization"]);
+
+        let results = network.discover_many(&["legal translation", "document summarization"], None);
+        assert_eq!(results.len(), 2);
+        // First query should find translate-agent
+        assert!(!results[0].is_empty());
+        // Second query should find summarize-agent
+        assert!(!results[1].is_empty());
+    }
+
+    #[test]
+    fn discover_many_empty_queries() {
+        let mut network = LocalNetwork::new();
+        reg(&mut network, "agent-a", &["data processing"]);
+        let results = network.discover_many(&[], None);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn discover_many_with_filters() {
+        let mut network = LocalNetwork::new();
+        let mut meta_mcp = HashMap::new();
+        meta_mcp.insert("protocol".to_string(), "mcp".to_string());
+        network.register("agent-mcp", &["legal translation"], None, meta_mcp);
+
+        let mut meta_rest = HashMap::new();
+        meta_rest.insert("protocol".to_string(), "rest".to_string());
+        network.register("agent-rest", &["legal translation"], None, meta_rest);
+
+        let mut filters = Filters::new();
+        filters.insert(
+            "protocol".to_string(),
+            FilterValue::Exact("mcp".to_string()),
+        );
+
+        let results =
+            network.discover_many(&["legal translation", "legal translation"], Some(&filters));
+        assert_eq!(results.len(), 2);
+        for query_results in &results {
+            assert_eq!(query_results.len(), 1);
+            assert_eq!(query_results[0].agent_name, "agent-mcp");
+        }
+    }
+
+    #[test]
+    fn save_io_error_on_invalid_path() {
+        let network = LocalNetwork::new();
+        let result = network.save("/nonexistent-dir/deeply/nested/file.json");
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), NetworkError::Io(_)));
+    }
+
+    #[test]
+    fn load_io_error_on_missing_file() {
+        let result = LocalNetwork::load("/tmp/nonexistent_alps_file_xyz.json");
+        assert!(result.is_err());
+        assert!(matches!(result.err().unwrap(), NetworkError::Io(_)));
+    }
+
+    #[test]
+    fn load_serialization_error_on_invalid_json() {
+        let path = "/tmp/alps_test_serde_error.json";
+        std::fs::write(path, "not valid json").expect("write test file");
+        let result = LocalNetwork::load(path);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.err().unwrap(),
+            NetworkError::Serialization(_)
+        ));
+        let _ = std::fs::remove_file(path);
     }
 }
