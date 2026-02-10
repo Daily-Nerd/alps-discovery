@@ -76,13 +76,50 @@ jobs:
         with:
           python-version: "3.13"
 
+      - name: Create virtual environment
+        run: python -m venv .venv
+
       - name: Install dependencies
         run: |
+          source .venv/bin/activate
           pip install maturin pytest
           maturin develop
+        env:
+          VIRTUAL_ENV: ${{ github.workspace }}/.venv
 
       - name: Run pytest
-        run: pytest tests/ -v
+        run: |
+          source .venv/bin/activate
+          pytest tests/ -v
+        env:
+          VIRTUAL_ENV: ${{ github.workspace }}/.venv
 
       - name: Smoke test example
-        run: python examples/01_quickstart.py
+        run: |
+          source .venv/bin/activate
+          python examples/01_quickstart.py
+        env:
+          VIRTUAL_ENV: ${{ github.workspace }}/.venv
+
+  benchmarks:
+    name: Benchmarks
+    runs-on: ubuntu-latest
+    needs: [rust]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Set PYO3_PYTHON
+        run: echo "PYO3_PYTHON=$(which python3)" >> $GITHUB_ENV
+
+      - name: Run benchmarks
+        run: cargo bench --features bench

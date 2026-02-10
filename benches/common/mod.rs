@@ -26,17 +26,20 @@ pub enum TextLength {
 
 /// Shared Criterion configuration for consistent benchmark timing.
 ///
-/// Configuration targets 60-second full suite budget (Requirement 5.2):
-/// - sample_size(20): reduced from default 100
-/// - measurement_time(2s): reduced from default 5s
-/// - warm_up_time(1s): reduced from default 3s
+/// Current settings optimized for balance between speed and statistical reliability:
+/// - sample_size(10): reduced from default 100
+/// - measurement_time(1s): reduced from default 5s
+/// - warm_up_time(500ms): reduced from default 3s
 /// - noise_threshold(0.05): 5% regression threshold (Requirement 3.4)
 /// - significance_level(0.05): 95% confidence (Requirement 3.4)
+///
+/// Full suite: ~166s for 71 benchmarks (exceeds original 60s target due to comprehensive coverage).
+/// For faster iteration, run individual targets: `cargo bench --bench <target>`
 pub fn criterion_config() -> Criterion {
     Criterion::default()
-        .sample_size(20)
-        .measurement_time(Duration::from_secs(2))
-        .warm_up_time(Duration::from_secs(1))
+        .sample_size(10)
+        .measurement_time(Duration::from_secs(1))
+        .warm_up_time(Duration::from_millis(500))
         .noise_threshold(0.05)
         .significance_level(0.05)
 }
