@@ -13,7 +13,7 @@ Usage:
 """
 
 try:
-    from ._native import LocalNetwork, DiscoveryResult
+    from ._native import LocalNetwork, DiscoveryResult, ExplainedResult
 except ImportError as e:
     raise ImportError(
         "Failed to import alps_discovery native module. "
@@ -70,4 +70,4 @@ def capabilities_from_mcp(tools: list[dict]) -> list[str]:
     return caps
 
 
-__all__ = ["LocalNetwork", "DiscoveryResult", "capabilities_from_mcp"]
+__all__ = ["LocalNetwork", "DiscoveryResult", "ExplainedResult", "capabilities_from_mcp"]

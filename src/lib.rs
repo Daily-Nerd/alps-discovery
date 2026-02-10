@@ -8,11 +8,13 @@ use pyo3::prelude::*;
 pub mod core;
 pub mod network;
 pub mod pybridge;
+pub mod scorer;
 
 /// ALPS Discovery — local agent discovery via bio-inspired routing.
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<pybridge::PyLocalNetwork>()?;
     m.add_class::<pybridge::PyDiscoveryResult>()?;
+    m.add_class::<pybridge::PyExplainedResult>()?;
     Ok(())
 }

@@ -2,8 +2,10 @@
 //
 // Minimal hypha state type for agent scoring.
 
+use serde::{Deserialize, Serialize};
+
 /// Pheromone-relevant state of an agent slot.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HyphaState {
     /// Connection diameter (strength/capacity).
     pub diameter: f64,

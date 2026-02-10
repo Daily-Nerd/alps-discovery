@@ -115,9 +115,9 @@ impl MinHasher {
     fn min_hash_words(&self, key: &[u8], seed: u64) -> u64 {
         let mut min_hash = u64::MAX;
         let mut found_word = false;
-        for word in key.split(|&b| {
-            b == b' ' || b == b'_' || b == b'-' || b == b'.' || b == b',' || b == b'\t'
-        }) {
+        for word in key
+            .split(|&b| b == b' ' || b == b'_' || b == b'-' || b == b'.' || b == b',' || b == b'\t')
+        {
             if !word.is_empty() {
                 let h = xxhash_with_seed(word, seed);
                 min_hash = min_hash.min(h);
@@ -382,7 +382,10 @@ mod tests {
         let config = LshConfig::default();
         let qs = compute_query_signature(b"test key", &config);
         let ss = compute_semantic_signature(b"test key", &config);
-        assert_eq!(qs.minhash, ss, "query and semantic signatures should match for same key");
+        assert_eq!(
+            qs.minhash, ss,
+            "query and semantic signatures should match for same key"
+        );
     }
 
     #[test]

@@ -9,6 +9,8 @@ Register agents with capability descriptions, then discover the best match for a
 Requires Python 3.11+ and [Rust](https://rustup.rs/).
 
 ```bash
+# Eventually: pip install alps-discovery
+# For now (development):
 pip install maturin
 git clone https://github.com/Daily-Nerd/alps-discovery.git
 cd alps-discovery
@@ -95,11 +97,55 @@ network.record_failure("summarize-agent")
 results = network.discover("translate legal contract")
 ```
 
+## Metadata filtering
+
+Filter discovery results by agent metadata:
+
+```python
+network.register("fast-mcp", ["translation"],
+                  endpoint="http://localhost:8080",
+                  metadata={"protocol": "mcp", "latency_ms": "50"})
+
+results = network.discover("translate contract",
+                           filters={"protocol": "mcp"})
+
+# Operator syntax:
+results = network.discover("translate contract",
+                           filters={"latency_ms": {"$lt": 100}})
+```
+
+## Persistence
+
+Save and restore network state (agents, feedback, scoring):
+
+```python
+# Save state (agents, feedback, scoring)
+network.save("state.json")
+
+# Load on restart
+network = alps.LocalNetwork.load("state.json")
+```
+
+## Explain mode
+
+Inspect how scores are calculated:
+
+```python
+results = network.discover("translate contract", explain=True)
+for r in results:
+    print(f"{r.agent_name}: sim={r.raw_similarity:.3f}, "
+          f"diameter={r.diameter:.3f}, feedback={r.feedback_factor:.3f}, "
+          f"score={r.final_score:.3f}")
+```
+
 ## API
 
-### `LocalNetwork()`
+### `LocalNetwork(*, similarity_threshold=None, scorer=None)`
 
 Create a new discovery network.
+
+- `similarity_threshold` — optional float `[0.0, 1.0]` to filter low-similarity matches (default: 0.1)
+- `scorer` — optional custom scorer object implementing the scorer protocol (see [Community Scorers](#community-scorers))
 
 ### `.register(name, capabilities, *, endpoint=None, metadata=None, invoke=None)`
 
@@ -115,15 +161,38 @@ Register an agent.
 
 Remove an agent. Returns `True` if found.
 
-### `.discover(query: str) -> list[DiscoveryResult]`
+### `.discover(query: str, *, filters=None, explain=False) -> list[DiscoveryResult]`
 
-Find agents matching a query. Returns results sorted by score (best first). Each result has:
+Find agents matching a query. Returns results sorted by score (best first).
+
+- `filters` — optional dict of metadata key-value pairs to filter results (supports operators like `{"latency_ms": {"$lt": 100}}`)
+- `explain` — if `True`, returns `ExplainedResult` objects with detailed scoring breakdown
+
+Each `DiscoveryResult` has:
 - `agent_name` — the matched agent
 - `similarity` — capability match strength `[0.0, 1.0]`
 - `score` — combined routing score (similarity x diameter, adjusted by feedback)
 - `endpoint` — agent URI/URL if provided at registration, else `None`
 - `metadata` — dict of key-value pairs if provided, else `{}`
 - `invoke` — callable if provided at registration, else `None`
+
+Each `ExplainedResult` has all `DiscoveryResult` fields plus:
+- `raw_similarity` — base similarity before feedback
+- `diameter` — agent's routing weight (adjusted by feedback)
+- `feedback_factor` — multiplier from success/failure history
+- `final_score` — `raw_similarity * diameter * feedback_factor`
+
+### `.discover_filtered(query: str, filters: dict) -> list[DiscoveryResult]`
+
+Direct filtered discovery (Rust API). Equivalent to `.discover(query, filters=filters)`.
+
+### `.save(path: str)`
+
+Save network state (agents, feedback, scoring) to a JSON file.
+
+### `LocalNetwork.load(path: str) -> LocalNetwork`
+
+Load network state from a JSON file. Returns a new `LocalNetwork` instance.
 
 ### `.record_success(agent_name)` / `.record_failure(agent_name)`
 
@@ -148,11 +217,44 @@ Three independent reasoning kernels vote on routing:
 
 Success/failure feedback adjusts the agent's diameter (routing weight), creating an adaptive system that learns which agents deliver.
 
+## Community Scorers
+
+The MinHash default handles lexical matching well. For semantic similarity (synonyms, paraphrases), implement the scorer protocol and pass it to `LocalNetwork(scorer=...)`:
+
+```python
+class EmbeddingScorer:
+    """Example: plug in sentence-transformers for semantic matching."""
+    def __init__(self, model_name="all-MiniLM-L6-v2"):
+        from sentence_transformers import SentenceTransformer
+        self.model = SentenceTransformer(model_name)
+        self.agents = {}
+
+    def index_capabilities(self, agent_id, capabilities):
+        self.agents[agent_id] = self.model.encode(capabilities)
+
+    def remove_agent(self, agent_id):
+        self.agents.pop(agent_id, None)
+
+    def score(self, query):
+        import numpy as np
+        q_emb = self.model.encode([query])[0]
+        results = []
+        for agent_id, cap_embs in self.agents.items():
+            sims = np.dot(cap_embs, q_emb) / (
+                np.linalg.norm(cap_embs, axis=1) * np.linalg.norm(q_emb)
+            )
+            sim = float(np.max(sims))
+            if sim > 0.3:
+                results.append((agent_id, sim))
+        return results
+
+# Use it:
+network = alps.LocalNetwork(scorer=EmbeddingScorer())
+```
+
 ## Current limitations
 
-- **Lexical matching, not semantic.** Similarity is based on character n-grams (MinHash), not meaning. Use descriptive capability strings for best results. Embedding-based matching is planned.
-
-- **In-memory only.** State doesn't persist across restarts. Re-register agents on startup.
+- **Lexical matching by default.** Similarity is based on character n-grams (MinHash), not meaning. Use descriptive capability strings for best results. For semantic matching (synonyms, paraphrases), use a pluggable scorer (see [Community Scorers](#community-scorers)).
 
 - **Single-process.** Network discovery across machines is in development.
 

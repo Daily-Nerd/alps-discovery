@@ -186,11 +186,7 @@ impl SLNEnzyme {
     }
 
     /// Evaluate all kernels and produce a routing decision via majority vote.
-    fn evaluate_kernels(
-        &self,
-        signal: &Signal,
-        hyphae: &[&Hypha],
-    ) -> EnzymeAction {
+    fn evaluate_kernels(&self, signal: &Signal, hyphae: &[&Hypha]) -> EnzymeAction {
         if hyphae.is_empty() {
             return EnzymeAction::Dissolve;
         }
@@ -217,9 +213,7 @@ impl SLNEnzyme {
 
         // Majority or unanimity → forward to the winner.
         if best_count * 2 >= self.kernels.len() {
-            EnzymeAction::Forward {
-                target: best_hypha,
-            }
+            EnzymeAction::Forward { target: best_hypha }
         } else {
             // No majority → split across distinct top picks.
             let mut targets: Vec<HyphaId> = votes.keys().cloned().collect();
