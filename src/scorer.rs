@@ -271,7 +271,7 @@ impl Scorer for TfIdfScorer {
 
     fn score(&self, query: &str) -> Result<Vec<(String, f64)>, String> {
         let query_tf = Self::compute_tf(&[query]);
-        Ok(self
+        let mut results: Vec<(String, f64)> = self
             .agents
             .iter()
             .map(|(agent_id, agent_tf)| {
@@ -279,7 +279,12 @@ impl Scorer for TfIdfScorer {
                 (agent_id.clone(), sim)
             })
             .filter(|(_, sim)| *sim > 0.0)
-            .collect())
+            .collect();
+
+        // Sort descending by similarity (highest first)
+        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        Ok(results)
     }
 }
 
@@ -464,6 +469,38 @@ mod tests {
         assert!(
             !results.is_empty(),
             "truncated capability should still match"
+        );
+    }
+
+    // --- Task 7.2: TfIdfScorer sorting test ---
+
+    #[test]
+    fn tfidf_scorer_results_sorted_descending() {
+        let mut scorer = TfIdfScorer::new();
+        scorer.index_capabilities("high-match", &["legal translation patent filing"]);
+        scorer.index_capabilities("medium-match", &["legal translation"]);
+        scorer.index_capabilities("low-match", &["legal"]);
+
+        let results = scorer.score("legal translation patent").unwrap();
+
+        assert!(results.len() >= 3, "should return all 3 agents");
+
+        // Verify descending order by similarity
+        for i in 0..results.len() - 1 {
+            assert!(
+                results[i].1 >= results[i + 1].1,
+                "results[{}] similarity ({:.3}) should be >= results[{}] similarity ({:.3})",
+                i,
+                results[i].1,
+                i + 1,
+                results[i + 1].1
+            );
+        }
+
+        // Verify highest match is first
+        assert_eq!(
+            results[0].0, "high-match",
+            "highest similarity should be first"
         );
     }
 
