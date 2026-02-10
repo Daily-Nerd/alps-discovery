@@ -1,0 +1,14 @@
+[build-system]
+requires = ["maturin>=1.7"]
+build-backend = "maturin"
+
+[project]
+name = "alps-discovery"
+version = "0.1.0"
+description = "Local agent discovery via bio-inspired routing"
+requires-python = ">=3.11"
+
+[tool.maturin]
+python-source = "python"
+module-name = "alps_discovery._native"
+features = ["pyo3/extension-module"]
