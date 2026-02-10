@@ -59,6 +59,17 @@ pub struct ExplainedResult {
     pub metadata: HashMap<String, String>,
 }
 
+/// Internal scored candidate used by the shared discovery pipeline.
+struct ScoredCandidate {
+    agent_name: String,
+    raw_similarity: f64,
+    diameter: f64,
+    feedback_factor: f64,
+    final_score: f64,
+    endpoint: Option<String>,
+    metadata: HashMap<String, String>,
+}
+
 /// Maximum number of feedback records stored per agent.
 const MAX_FEEDBACK_RECORDS: usize = 100;
 
@@ -312,6 +323,44 @@ impl LocalNetwork {
         query: &str,
         filters: Option<&Filters>,
     ) -> Vec<DiscoveryResult> {
+        self.discover_core(query, filters)
+            .into_iter()
+            .map(|c| DiscoveryResult {
+                agent_name: c.agent_name,
+                similarity: c.raw_similarity,
+                score: c.final_score,
+                endpoint: c.endpoint,
+                metadata: c.metadata,
+            })
+            .collect()
+    }
+
+    /// Discover agents with full scoring breakdown for debugging.
+    ///
+    /// Returns all matching agents with detailed scoring components:
+    /// raw similarity, diameter, feedback factor, and final score.
+    /// Supports the same filters and tie-breaking as regular discover.
+    pub fn discover_explained(
+        &mut self,
+        query: &str,
+        filters: Option<&Filters>,
+    ) -> Vec<ExplainedResult> {
+        self.discover_core(query, filters)
+            .into_iter()
+            .map(|c| ExplainedResult {
+                agent_name: c.agent_name,
+                raw_similarity: c.raw_similarity,
+                diameter: c.diameter,
+                feedback_factor: c.feedback_factor,
+                final_score: c.final_score,
+                endpoint: c.endpoint,
+                metadata: c.metadata,
+            })
+            .collect()
+    }
+
+    /// Shared discovery pipeline: scoring, feedback, tie-breaking, filtering, enzyme update.
+    fn discover_core(&mut self, query: &str, filters: Option<&Filters>) -> Vec<ScoredCandidate> {
         if self.agents.is_empty() {
             return Vec::new();
         }
@@ -323,7 +372,7 @@ impl LocalNetwork {
         let score_map: HashMap<String, f64> = raw_scores.into_iter().collect();
 
         // Build results with diameter and feedback adjustments.
-        let mut results: Vec<DiscoveryResult> = self
+        let mut results: Vec<ScoredCandidate> = self
             .agents
             .iter()
             .filter_map(|(name, record)| {
@@ -341,10 +390,12 @@ impl LocalNetwork {
                     record.hypha.state.diameter * (1.0 + feedback_factor * FEEDBACK_STRENGTH);
 
                 let score = sim * adjusted_diameter;
-                Some(DiscoveryResult {
+                Some(ScoredCandidate {
                     agent_name: name.clone(),
-                    similarity: sim,
-                    score,
+                    raw_similarity: sim,
+                    diameter: record.hypha.state.diameter,
+                    feedback_factor,
+                    final_score: score,
                     endpoint: record.endpoint.clone(),
                     metadata: record.metadata.clone(),
                 })
@@ -352,18 +403,18 @@ impl LocalNetwork {
             .collect();
 
         results.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
+            b.final_score
+                .partial_cmp(&a.final_score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
         // Randomized tie-breaking: shuffle agents within 5% of top score.
         if results.len() > 1 {
-            let top_score = results[0].score;
+            let top_score = results[0].final_score;
             let tie_threshold = top_score * 0.95;
             let tie_count = results
                 .iter()
-                .take_while(|r| r.score >= tie_threshold)
+                .take_while(|r| r.final_score >= tie_threshold)
                 .count();
             if tie_count > 1 {
                 // Deterministic-ish shuffle using xxhash seeded by query + system time.
@@ -421,60 +472,6 @@ impl LocalNetwork {
                 }
             }
         }
-
-        results
-    }
-
-    /// Discover agents with full scoring breakdown for debugging.
-    ///
-    /// Returns all matching agents with detailed scoring components:
-    /// raw similarity, diameter, feedback factor, and final score.
-    /// Useful for understanding why the routing engine made specific choices.
-    pub fn discover_explained(&mut self, query: &str) -> Vec<ExplainedResult> {
-        if self.agents.is_empty() {
-            return Vec::new();
-        }
-
-        let query_sig = compute_query_signature(query.as_bytes(), &self.lsh_config);
-
-        let raw_scores = self.scorer.score(query);
-        let score_map: HashMap<String, f64> = raw_scores.into_iter().collect();
-
-        let mut results: Vec<ExplainedResult> = self
-            .agents
-            .iter()
-            .filter_map(|(name, record)| {
-                let sim = score_map.get(name).copied().unwrap_or(0.0);
-                if sim < self.lsh_config.similarity_threshold {
-                    return None;
-                }
-
-                let feedback_factor = Self::compute_feedback_factor(
-                    &record.feedback,
-                    &query_sig.minhash,
-                    self.lsh_config.similarity_threshold,
-                );
-                let adjusted_diameter =
-                    record.hypha.state.diameter * (1.0 + feedback_factor * FEEDBACK_STRENGTH);
-                let score = sim * adjusted_diameter;
-
-                Some(ExplainedResult {
-                    agent_name: name.clone(),
-                    raw_similarity: sim,
-                    diameter: record.hypha.state.diameter,
-                    feedback_factor,
-                    final_score: score,
-                    endpoint: record.endpoint.clone(),
-                    metadata: record.metadata.clone(),
-                })
-            })
-            .collect();
-
-        results.sort_by(|a, b| {
-            b.final_score
-                .partial_cmp(&a.final_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
 
         results
     }
@@ -601,7 +598,7 @@ impl LocalNetwork {
     /// to `Instant::now()` on load.
     pub fn save(&self, path: &str) -> Result<(), String> {
         let snapshot = NetworkSnapshot {
-            version: 1,
+            version: Self::SNAPSHOT_VERSION,
             agents: self
                 .agents
                 .iter()
@@ -641,9 +638,20 @@ impl LocalNetwork {
     ///
     /// Uses the default MinHash scorer. For custom scorers, load then
     /// reconfigure.
+    /// Current snapshot schema version.
+    const SNAPSHOT_VERSION: u32 = 1;
+
     pub fn load(path: &str) -> Result<Self, String> {
         let json = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
         let snapshot: NetworkSnapshot = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+
+        if snapshot.version > Self::SNAPSHOT_VERSION {
+            return Err(format!(
+                "snapshot version {} is newer than supported version {}; upgrade alps-discovery",
+                snapshot.version,
+                Self::SNAPSHOT_VERSION
+            ));
+        }
 
         let mut network = Self::new();
 
@@ -665,15 +673,16 @@ impl LocalNetwork {
                 record.hypha.state.forwards_count = agent.forwards_count;
                 record.hypha.state.consecutive_pulse_timeouts = agent.consecutive_pulse_timeouts;
 
-                // Restore feedback history.
-                record.feedback = agent
-                    .feedback
-                    .into_iter()
-                    .map(|fb| FeedbackRecord {
-                        query_minhash: fb.query_minhash,
-                        outcome: fb.outcome,
-                    })
-                    .collect();
+                // Restore feedback history, capped at MAX_FEEDBACK_RECORDS.
+                let feedback_iter = agent.feedback.into_iter().map(|fb| FeedbackRecord {
+                    query_minhash: fb.query_minhash,
+                    outcome: fb.outcome,
+                });
+                let mut feedback: VecDeque<FeedbackRecord> = feedback_iter.collect();
+                while feedback.len() > MAX_FEEDBACK_RECORDS {
+                    feedback.pop_front();
+                }
+                record.feedback = feedback;
             }
         }
 
@@ -1438,6 +1447,22 @@ mod tests {
     }
 
     #[test]
+    fn load_rejects_future_snapshot_version() {
+        let path = "/tmp/alps_test_future_version.json";
+        let json = r#"{"version": 99, "agents": []}"#;
+        std::fs::write(path, json).expect("write test file");
+        let result = LocalNetwork::load(path);
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(
+            err.contains("newer than supported"),
+            "error should mention version mismatch: {}",
+            err
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn save_and_load_empty_network() {
         let network = LocalNetwork::new();
         let path = "/tmp/alps_test_empty.json";
@@ -1464,7 +1489,7 @@ mod tests {
             network.record_success("translate-agent", Some("translate legal contract"));
         }
 
-        let results = network.discover_explained("translate legal contract");
+        let results = network.discover_explained("translate legal contract", None);
         assert!(!results.is_empty());
         let r = &results[0];
         assert_eq!(r.agent_name, "translate-agent");
@@ -1488,19 +1513,27 @@ mod tests {
         // Run regular discover
         let regular = network.discover("legal translation");
         // Run explained discover
-        let explained = network.discover_explained("legal translation");
+        let explained = network.discover_explained("legal translation", None);
 
         // Same number of results
         assert_eq!(regular.len(), explained.len());
 
-        // Scores should match (no tie-breaking in explained mode)
-        for (reg_r, exp_r) in regular.iter().zip(explained.iter()) {
-            assert_eq!(reg_r.agent_name, exp_r.agent_name);
-            assert!((reg_r.similarity - exp_r.raw_similarity).abs() < 0.001);
-            // final_score should match score (both use same formula)
+        // Scores should match (both use same discover_core pipeline).
+        // Compare by agent name since tie-breaking is randomized per call.
+        for exp_r in &explained {
+            let reg_r = regular
+                .iter()
+                .find(|r| r.agent_name == exp_r.agent_name)
+                .expect("explained agent should appear in regular results");
+            assert!(
+                (reg_r.similarity - exp_r.raw_similarity).abs() < 0.001,
+                "{}: similarity mismatch",
+                exp_r.agent_name
+            );
             assert!(
                 (reg_r.score - exp_r.final_score).abs() < 0.001,
-                "regular score ({:.4}) should match explained final_score ({:.4})",
+                "{}: regular score ({:.4}) should match explained final_score ({:.4})",
+                exp_r.agent_name,
                 reg_r.score,
                 exp_r.final_score
             );
@@ -1510,15 +1543,39 @@ mod tests {
     #[test]
     fn explain_empty_network() {
         let mut network = LocalNetwork::new();
-        let results = network.discover_explained("anything");
+        let results = network.discover_explained("anything", None);
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn explain_with_filters() {
+        let mut network = LocalNetwork::new();
+        let mut meta_mcp = HashMap::new();
+        meta_mcp.insert("protocol".to_string(), "mcp".to_string());
+        network.register("agent-mcp", &["legal translation"], None, meta_mcp);
+
+        let mut meta_rest = HashMap::new();
+        meta_rest.insert("protocol".to_string(), "rest".to_string());
+        network.register("agent-rest", &["legal translation"], None, meta_rest);
+
+        let mut filters = Filters::new();
+        filters.insert(
+            "protocol".to_string(),
+            FilterValue::Exact("mcp".to_string()),
+        );
+
+        let results = network.discover_explained("legal translation", Some(&filters));
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].agent_name, "agent-mcp");
+        assert!(results[0].raw_similarity > 0.0);
+        assert!(results[0].diameter > 0.0);
     }
 
     #[test]
     fn explain_feedback_factor_zero_without_feedback() {
         let mut network = LocalNetwork::new();
         reg(&mut network, "agent-a", &["data processing"]);
-        let results = network.discover_explained("data processing");
+        let results = network.discover_explained("data processing", None);
         assert!(!results.is_empty());
         assert!(
             results[0].feedback_factor.abs() < 0.001,

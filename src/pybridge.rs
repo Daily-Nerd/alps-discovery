@@ -32,22 +32,45 @@ impl Scorer for PyScorer {
     fn index_capabilities(&mut self, agent_id: &str, capabilities: &[&str]) {
         Python::attach(|py| {
             let caps: Vec<String> = capabilities.iter().map(|s| s.to_string()).collect();
-            let _ = self
+            if let Err(e) = self
                 .inner
-                .call_method1(py, "index_capabilities", (agent_id, caps));
+                .call_method1(py, "index_capabilities", (agent_id, caps))
+            {
+                eprintln!(
+                    "alps-discovery: scorer.index_capabilities() failed for '{}': {}",
+                    agent_id, e
+                );
+            }
         });
     }
 
     fn remove_agent(&mut self, agent_id: &str) {
         Python::attach(|py| {
-            let _ = self.inner.call_method1(py, "remove_agent", (agent_id,));
+            if let Err(e) = self.inner.call_method1(py, "remove_agent", (agent_id,)) {
+                eprintln!(
+                    "alps-discovery: scorer.remove_agent() failed for '{}': {}",
+                    agent_id, e
+                );
+            }
         });
     }
 
     fn score(&self, query: &str) -> Vec<(String, f64)> {
         Python::attach(|py| match self.inner.call_method1(py, "score", (query,)) {
-            Ok(result) => result.extract::<Vec<(String, f64)>>(py).unwrap_or_default(),
-            Err(_) => Vec::new(),
+            Ok(result) => match result.extract::<Vec<(String, f64)>>(py) {
+                Ok(scores) => scores,
+                Err(e) => {
+                    eprintln!(
+                        "alps-discovery: scorer.score() returned invalid type: {}",
+                        e
+                    );
+                    Vec::new()
+                }
+            },
+            Err(e) => {
+                eprintln!("alps-discovery: scorer.score() failed: {}", e);
+                Vec::new()
+            }
         })
     }
 }
@@ -169,10 +192,21 @@ impl PyLocalNetwork {
         filters: Option<HashMap<String, Py<PyAny>>>,
         explain: bool,
     ) -> PyResult<Py<PyAny>> {
+        let rust_filters = if let Some(py_filters) = filters {
+            let mut f = crate::network::Filters::new();
+            for (key, value) in py_filters {
+                let filter_value = Self::parse_filter_value(py, &value)?;
+                f.insert(key, filter_value);
+            }
+            Some(f)
+        } else {
+            None
+        };
+
         if explain {
             let results: Vec<PyExplainedResult> = self
                 .inner
-                .discover_explained(query)
+                .discover_explained(query, rust_filters.as_ref())
                 .into_iter()
                 .map(|r| PyExplainedResult {
                     agent_name: r.agent_name,
@@ -186,17 +220,6 @@ impl PyLocalNetwork {
                 .collect();
             Ok(results.into_pyobject(py)?.into_any().unbind())
         } else {
-            let rust_filters = if let Some(py_filters) = filters {
-                let mut f = crate::network::Filters::new();
-                for (key, value) in py_filters {
-                    let filter_value = Self::parse_filter_value(py, &value)?;
-                    f.insert(key, filter_value);
-                }
-                Some(f)
-            } else {
-                None
-            };
-
             let results: Vec<PyDiscoveryResult> = self
                 .inner
                 .discover_filtered(query, rust_filters.as_ref())

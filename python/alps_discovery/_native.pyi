@@ -53,8 +53,9 @@ class LocalNetwork:
 
         Args:
             query: Natural-language capability query.
-            filters: Optional metadata filters. String values for exact match,
-                or dicts with $in, $lt, $gt, $contains operators.
+            filters: Optional metadata filters (applied in both normal and explain
+                mode). String values for exact match, or dicts with $in, $lt,
+                $gt, $contains operators.
             explain: If True, returns ExplainedResult with scoring breakdown.
 
         Returns:
