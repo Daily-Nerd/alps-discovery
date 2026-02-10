@@ -45,7 +45,7 @@ class LocalNetwork:
     @overload
     def discover(
         self,
-        query: str,
+        query: str | Query,
         *,
         filters: dict[str, Any] | None = None,
         explain: bool = False,
@@ -54,7 +54,8 @@ class LocalNetwork:
         """Discover agents matching a query.
 
         Args:
-            query: Natural-language capability query.
+            query: Natural-language capability query string, or a Query
+                object for composable capability algebra.
             filters: Optional metadata filters. String values for exact match,
                 or dicts with $in, $lt, $gt, $contains operators.
             explain: If True, returns ExplainedResult with scoring breakdown.
@@ -122,6 +123,57 @@ class LocalNetwork:
         """Load network state from a JSON file."""
         ...
 
+class Query:
+    """Composable query expression for agent discovery.
+
+    Supports set-theoretic composition of text queries:
+
+    - ``Query.all("legal translation", "German language")``
+      — agent must match ALL terms (min similarity)
+    - ``Query.any("translate", "interpret")``
+      — agent can match ANY term (max similarity)
+    - ``Query.all("translate").exclude("medical")``
+      — match but penalise unwanted matches
+    - ``Query.weighted({"translate": 2.0, "legal": 1.0})``
+      — weighted combination
+
+    Pass a Query to ``network.discover()`` in place of a string.
+    """
+
+    @staticmethod
+    def all(*queries: str | Query) -> Query:
+        """Create an All query (AND semantics).
+
+        Agent must match ALL sub-queries. Score = min across sub-queries.
+        """
+        ...
+
+    @staticmethod
+    def any(*queries: str | Query) -> Query:
+        """Create an Any query (OR semantics).
+
+        Agent can match ANY sub-query. Score = max across sub-queries.
+        """
+        ...
+
+    @staticmethod
+    def weighted(mapping: dict[str, float]) -> Query:
+        """Create a Weighted query.
+
+        Score = weighted average of sub-query similarities.
+
+        Args:
+            mapping: Dict mapping query strings to weight floats.
+        """
+        ...
+
+    def exclude(self, query: str | Query) -> Query:
+        """Chain an exclusion onto this query.
+
+        Agents matching the exclusion have their score reduced proportionally.
+        """
+        ...
+
 class DiscoveryResult:
     """A single discovery result.
 
@@ -147,6 +199,8 @@ class ExplainedResult:
     Attributes:
         agent_name: The matched agent's name.
         raw_similarity: Raw capability similarity from the scorer [0.0, 1.0].
+        similarity_lower: Lower bound of 95% confidence interval.
+        similarity_upper: Upper bound of 95% confidence interval.
         diameter: Agent's routing diameter (weight from feedback history).
         enzyme_score: Normalized composite enzyme score [0.0, 1.0].
         feedback_factor: Per-query feedback adjustment [-1.0, 1.0].
@@ -157,6 +211,8 @@ class ExplainedResult:
 
     agent_name: str
     raw_similarity: float
+    similarity_lower: float
+    similarity_upper: float
     diameter: float
     enzyme_score: float
     feedback_factor: float

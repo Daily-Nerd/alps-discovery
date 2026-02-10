@@ -13,7 +13,13 @@ Usage:
 """
 
 try:
-    from ._native import DiscoveryResponse, DiscoveryResult, ExplainedResult, LocalNetwork
+    from ._native import (
+        DiscoveryResponse,
+        DiscoveryResult,
+        ExplainedResult,
+        LocalNetwork,
+        Query,
+    )
 except ImportError as e:
     raise ImportError(
         "Failed to import alps_discovery native module. "
@@ -75,5 +81,6 @@ __all__ = [
     "DiscoveryResult",
     "ExplainedResult",
     "LocalNetwork",
+    "Query",
     "capabilities_from_mcp",
 ]

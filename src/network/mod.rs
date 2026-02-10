@@ -4,190 +4,29 @@
 // No networking, no decay, no membrane — just the routing engine
 // applied to Chemistry-based capability matching.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::time::{Duration, Instant};
+mod enzyme_adapter;
+mod filter;
+mod persistence;
+pub(crate) mod pipeline;
+pub(crate) mod registry;
+mod scorer_adapter;
 
-use serde::{Deserialize, Serialize};
-use serde_big_array::BigArray;
+use std::collections::{BTreeMap, HashMap};
 
-use thiserror::Error;
+use crate::core::config::LshConfig;
+use crate::core::enzyme::SLNEnzymeConfig;
+use crate::scorer::Scorer;
 
-use crate::core::chemistry::Chemistry;
-use crate::core::config::{LshConfig, SporeConfig};
-use crate::core::enzyme::{Enzyme, KernelEvaluation, SLNEnzyme, SLNEnzymeConfig};
-use crate::core::hyphae::Hypha;
-use crate::core::lsh::{compute_query_signature, compute_semantic_signature, MinHasher};
-use crate::core::membrane::MembraneState;
-use crate::core::pheromone::HyphaState;
-use crate::core::signal::{Signal, Tendril};
-use crate::core::spore::tree::Spore;
-use crate::core::types::KernelType;
-use crate::core::types::{HyphaId, PeerAddr, TrailId};
+// Re-export public API types.
+pub use filter::{FilterValue, Filters};
+pub use persistence::NetworkError;
+pub use pipeline::{DiscoveryConfidence, DiscoveryResponse, DiscoveryResult, ExplainedResult};
 
-use crate::core::action::EnzymeAction;
-use crate::core::config::QueryConfig;
-use crate::scorer::{MinHashScorer, Scorer};
-
-/// Structured error type for network persistence operations.
-#[derive(Debug, Error)]
-pub enum NetworkError {
-    /// JSON serialization/deserialization failure.
-    #[error("serialization error: {0}")]
-    Serialization(#[from] serde_json::Error),
-    /// File system I/O failure.
-    #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
-    /// Snapshot version is newer than what this library supports.
-    #[error("unsupported snapshot version {found} (supported up to {supported})")]
-    UnsupportedVersion { found: u32, supported: u32 },
-}
-
-/// A single discovery result with scoring breakdown.
-#[derive(Debug, Clone)]
-pub struct DiscoveryResult {
-    /// Agent name.
-    pub agent_name: String,
-    /// Raw Chemistry similarity to the query [0.0, 1.0].
-    pub similarity: f64,
-    /// Combined routing score (similarity × diameter, plus feedback effects).
-    pub score: f64,
-    /// Agent endpoint (URI, URL, module path, etc.) if provided at registration.
-    pub endpoint: Option<String>,
-    /// Arbitrary metadata (protocol, version, framework, etc.) if provided.
-    pub metadata: HashMap<String, String>,
-}
-
-/// Extended discovery result with full scoring breakdown for debugging.
-#[derive(Debug, Clone)]
-pub struct ExplainedResult {
-    /// Agent name.
-    pub agent_name: String,
-    /// Raw similarity from the scorer [0.0, 1.0].
-    pub raw_similarity: f64,
-    /// Agent diameter (routing weight from feedback history).
-    pub diameter: f64,
-    /// Normalized composite enzyme score [0.0, 1.0].
-    pub enzyme_score: f64,
-    /// Per-query feedback factor [-1.0, 1.0].
-    pub feedback_factor: f64,
-    /// Final combined score.
-    pub final_score: f64,
-    /// Agent endpoint if provided at registration.
-    pub endpoint: Option<String>,
-    /// Agent metadata if provided at registration.
-    pub metadata: HashMap<String, String>,
-}
-
-/// Confidence level of a discovery decision based on kernel agreement.
-#[derive(Debug, Clone, PartialEq)]
-pub enum DiscoveryConfidence {
-    /// All kernels agree on the top agent.
-    Unanimous,
-    /// Majority of kernels agree. One dissents.
-    Majority { dissenting_kernel: KernelType },
-    /// No majority. Caller should consider parallel execution.
-    Split { alternative_agents: Vec<String> },
-}
-
-/// Discovery response with confidence signal.
-#[derive(Debug, Clone)]
-pub struct DiscoveryResponse {
-    /// Ranked discovery results.
-    pub results: Vec<DiscoveryResult>,
-    /// Kernel agreement confidence level.
-    pub confidence: DiscoveryConfidence,
-    /// Recommended number of agents to invoke in parallel.
-    pub recommended_parallelism: usize,
-}
-
-/// Internal scored candidate used by the shared discovery pipeline.
-struct ScoredCandidate {
-    agent_name: String,
-    raw_similarity: f64,
-    diameter: f64,
-    enzyme_score: f64,
-    feedback_factor: f64,
-    final_score: f64,
-    endpoint: Option<String>,
-    metadata: HashMap<String, String>,
-}
-
-/// Lightweight candidate with borrowed fields for the pre-filter scoring phase.
-/// Only survivors get promoted to owned ScoredCandidate.
-struct CandidateRef<'a> {
-    agent_name: &'a str,
-    raw_similarity: f64,
-    diameter: f64,
-    enzyme_score: f64,
-    feedback_factor: f64,
-    final_score: f64,
-    endpoint: &'a Option<String>,
-    metadata: &'a HashMap<String, String>,
-}
-
-/// Maximum number of feedback records stored per agent.
-const MAX_FEEDBACK_RECORDS: usize = 100;
-
-/// Strength of per-query feedback adjustment to diameter (max ±20%).
-/// Research: "Low-exploitation + high-fan-out outperforms high-exploitation
-/// + low-fan-out in sparse networks."
-const FEEDBACK_STRENGTH: f64 = 0.2;
-
-/// Minimum floor for tau pheromone. Prevents tau=0 absorbing state
-/// which creates infinite first-mover advantage (zero-trap).
-const TAU_FLOOR: f64 = 0.001;
-
-/// A single recorded outcome for a specific query type.
-struct FeedbackRecord {
-    /// MinHash signature of the query that produced this outcome.
-    query_minhash: [u8; 64],
-    /// +1.0 for success, -1.0 for failure.
-    outcome: f64,
-}
-
-/// Per-agent record stored in the network.
-struct AgentRecord {
-    /// Capability descriptions retained for introspection and explain mode.
-    capabilities: Vec<String>,
-    endpoint: Option<String>,
-    metadata: HashMap<String, String>,
-    hypha: Hypha,
-    /// Per-query-type feedback history (most recent last).
-    feedback: VecDeque<FeedbackRecord>,
-}
-
-/// A filter condition for metadata-based result filtering.
-#[derive(Debug, Clone)]
-pub enum FilterValue {
-    /// Exact string match.
-    Exact(String),
-    /// Substring containment check.
-    Contains(String),
-    /// Value must be one of the listed options.
-    OneOf(Vec<String>),
-    /// Numeric value must be less than the threshold.
-    LessThan(f64),
-    /// Numeric value must be greater than the threshold.
-    GreaterThan(f64),
-}
-
-impl FilterValue {
-    /// Check if a metadata value matches this filter condition.
-    fn matches(&self, value: &str) -> bool {
-        match self {
-            FilterValue::Exact(expected) => value == expected,
-            FilterValue::Contains(substring) => value.contains(substring.as_str()),
-            FilterValue::OneOf(options) => options.iter().any(|o| o == value),
-            FilterValue::LessThan(threshold) => value.parse::<f64>().is_ok_and(|v| v < *threshold),
-            FilterValue::GreaterThan(threshold) => {
-                value.parse::<f64>().is_ok_and(|v| v > *threshold)
-            }
-        }
-    }
-}
-
-/// Metadata filters applied to discovery results.
-pub type Filters = HashMap<String, FilterValue>;
+// Internal imports from sub-modules.
+use enzyme_adapter::EnzymeAdapter;
+use pipeline::{derive_confidence, run_pipeline, run_pipeline_with_scores};
+use registry::AgentRecord;
+use scorer_adapter::ScorerAdapter;
 
 /// Local-mode agent discovery network.
 ///
@@ -201,80 +40,28 @@ pub type Filters = HashMap<String, FilterValue>;
 pub struct LocalNetwork {
     /// Registered agents keyed by name.
     agents: BTreeMap<String, AgentRecord>,
-    /// The multi-kernel reasoning enzyme.
-    enzyme: SLNEnzyme,
-    /// LSH configuration for signature generation.
-    lsh_config: LshConfig,
-    /// Pluggable scorer for agent-to-query matching.
-    scorer: Box<dyn Scorer>,
-    /// Empty spore (discovery only).
-    spore: Spore,
-    /// Static membrane state (passthrough).
-    membrane_state: MembraneState,
-}
-
-/// Serializable snapshot of the entire network state.
-#[derive(Serialize, Deserialize)]
-struct NetworkSnapshot {
-    /// Schema version for forward compatibility.
-    version: u32,
-    /// All registered agents with their state.
-    agents: Vec<AgentSnapshot>,
-}
-
-/// Serializable snapshot of a single agent.
-#[derive(Serialize, Deserialize)]
-struct AgentSnapshot {
-    name: String,
-    capabilities: Vec<String>,
-    endpoint: Option<String>,
-    metadata: HashMap<String, String>,
-    diameter: f64,
-    tau: f64,
-    sigma: f64,
-    omega: f64,
-    forwards_count: u64,
-    consecutive_pulse_timeouts: u8,
-    feedback: Vec<FeedbackSnapshot>,
-}
-
-/// Serializable snapshot of a single feedback record.
-#[derive(Serialize, Deserialize)]
-struct FeedbackSnapshot {
-    #[serde(with = "BigArray")]
-    query_minhash: [u8; 64],
-    outcome: f64,
+    /// Scorer adapter: pluggable scorer + LSH configuration.
+    scorer: ScorerAdapter,
+    /// Enzyme adapter: multi-kernel reasoning + vestigial state.
+    enzyme: EnzymeAdapter,
 }
 
 impl LocalNetwork {
     /// Creates a new empty LocalNetwork with default configuration.
     pub fn new() -> Self {
-        let config = LshConfig::default();
-        let scorer = MinHashScorer::new(config.clone());
-        Self::with_scorer(Box::new(scorer))
+        Self {
+            agents: BTreeMap::new(),
+            scorer: ScorerAdapter::new(LshConfig::default()),
+            enzyme: EnzymeAdapter::new(SLNEnzymeConfig::default()),
+        }
     }
 
     /// Creates a new LocalNetwork with custom configuration.
     pub fn with_config(enzyme_config: SLNEnzymeConfig, lsh_config: LshConfig) -> Self {
-        let scorer = MinHashScorer::new(lsh_config.clone());
         Self {
             agents: BTreeMap::new(),
-            enzyme: SLNEnzyme::with_discovery_kernels(enzyme_config),
-            lsh_config,
-            scorer: Box::new(scorer),
-            spore: Spore::new(SporeConfig::default()),
-            membrane_state: MembraneState {
-                permeability: 1.0,
-                deep_processing_active: false,
-                buffered_count: 0,
-                floor_duration: Duration::ZERO,
-                below_sporulation_duration: Duration::ZERO,
-                total_admitted: 0,
-                total_dissolved: 0,
-                total_processed: 0,
-                admitted_rate: 0.0,
-                dissolved_rate: 0.0,
-            },
+            scorer: ScorerAdapter::new(lsh_config),
+            enzyme: EnzymeAdapter::new(enzyme_config),
         }
     }
 
@@ -285,24 +72,14 @@ impl LocalNetwork {
     pub fn with_scorer(scorer: Box<dyn Scorer>) -> Self {
         Self {
             agents: BTreeMap::new(),
-            enzyme: SLNEnzyme::with_discovery_kernels(SLNEnzymeConfig::default()),
-            lsh_config: LshConfig::default(),
-            scorer,
-            spore: Spore::new(SporeConfig::default()),
-            membrane_state: MembraneState {
-                permeability: 1.0,
-                deep_processing_active: false,
-                buffered_count: 0,
-                floor_duration: Duration::ZERO,
-                below_sporulation_duration: Duration::ZERO,
-                total_admitted: 0,
-                total_dissolved: 0,
-                total_processed: 0,
-                admitted_rate: 0.0,
-                dissolved_rate: 0.0,
-            },
+            scorer: ScorerAdapter::with_scorer(scorer, LshConfig::default()),
+            enzyme: EnzymeAdapter::new(SLNEnzymeConfig::default()),
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Registration
+    // -----------------------------------------------------------------------
 
     /// Register an agent with its capabilities.
     ///
@@ -317,50 +94,27 @@ impl LocalNetwork {
         endpoint: Option<&str>,
         metadata: HashMap<String, String>,
     ) {
-        let hypha_id = Self::name_to_hypha_id(name);
-
-        // Still deposit Chemistry for the enzyme kernels.
-        let mut chemistry = Chemistry::default();
-        for cap in capabilities {
-            let sig = compute_semantic_signature(cap.as_bytes(), &self.lsh_config);
-            chemistry.deposit(&sig);
-        }
-
-        // Index in the scorer.
-        self.scorer.index_capabilities(name, capabilities);
-
-        let hypha = Hypha {
-            id: hypha_id,
-            peer: PeerAddr(format!("local://{}", name)),
-            state: HyphaState {
-                diameter: 1.0,
-                tau: 0.01,
-                sigma: 0.0,
-                omega: 0.0,
-                consecutive_pulse_timeouts: 0,
-                forwards_count: 0,
-            },
-            chemistry,
-            last_activity: Instant::now(),
-        };
-
-        self.agents.insert(
-            name.to_string(),
-            AgentRecord {
-                capabilities: capabilities.iter().map(|s| s.to_string()).collect(),
-                endpoint: endpoint.map(|s| s.to_string()),
-                metadata,
-                hypha,
-                feedback: VecDeque::new(),
-            },
+        let lsh_config = self.scorer.lsh_config().clone();
+        registry::register_agent(
+            &mut self.agents,
+            self.scorer.scorer_mut(),
+            &lsh_config,
+            name,
+            capabilities,
+            endpoint,
+            metadata,
         );
     }
 
     /// Deregister an agent by name. Returns true if found and removed.
     pub fn deregister(&mut self, name: &str) -> bool {
-        self.scorer.remove_agent(name);
+        self.scorer.scorer_mut().remove_agent(name);
         self.agents.remove(name).is_some()
     }
+
+    // -----------------------------------------------------------------------
+    // Discovery (string queries)
+    // -----------------------------------------------------------------------
 
     /// Discover agents matching a natural-language query.
     ///
@@ -384,17 +138,14 @@ impl LocalNetwork {
         query: &str,
         filters: Option<&Filters>,
     ) -> Vec<DiscoveryResult> {
-        let (candidates, _) = self.discover_core(query, filters);
-        candidates
-            .into_iter()
-            .map(|c| DiscoveryResult {
-                agent_name: c.agent_name,
-                similarity: c.raw_similarity,
-                score: c.final_score,
-                endpoint: c.endpoint,
-                metadata: c.metadata,
-            })
-            .collect()
+        let (candidates, _) = run_pipeline(
+            &mut self.agents,
+            &self.scorer,
+            &mut self.enzyme,
+            query,
+            filters,
+        );
+        candidates.into_iter().map(|c| c.into_result()).collect()
     }
 
     /// Discover agents with full scoring breakdown for debugging.
@@ -407,20 +158,14 @@ impl LocalNetwork {
         query: &str,
         filters: Option<&Filters>,
     ) -> Vec<ExplainedResult> {
-        let (candidates, _) = self.discover_core(query, filters);
-        candidates
-            .into_iter()
-            .map(|c| ExplainedResult {
-                agent_name: c.agent_name,
-                raw_similarity: c.raw_similarity,
-                diameter: c.diameter,
-                enzyme_score: c.enzyme_score,
-                feedback_factor: c.feedback_factor,
-                final_score: c.final_score,
-                endpoint: c.endpoint,
-                metadata: c.metadata,
-            })
-            .collect()
+        let (candidates, _) = run_pipeline(
+            &mut self.agents,
+            &self.scorer,
+            &mut self.enzyme,
+            query,
+            filters,
+        );
+        candidates.into_iter().map(|c| c.into_explained()).collect()
     }
 
     /// Discover agents for multiple queries in a single call.
@@ -471,249 +216,118 @@ impl LocalNetwork {
         query: &str,
         filters: Option<&Filters>,
     ) -> DiscoveryResponse {
-        let (candidates, kernel_eval) = self.discover_core(query, filters);
-
-        let (confidence, recommended_parallelism) = self.derive_confidence(&kernel_eval);
-
-        let results = candidates
-            .into_iter()
-            .map(|c| DiscoveryResult {
-                agent_name: c.agent_name,
-                similarity: c.raw_similarity,
-                score: c.final_score,
-                endpoint: c.endpoint,
-                metadata: c.metadata,
-            })
-            .collect();
-
+        let (candidates, kernel_eval) = run_pipeline(
+            &mut self.agents,
+            &self.scorer,
+            &mut self.enzyme,
+            query,
+            filters,
+        );
+        let (confidence, recommended_parallelism) =
+            derive_confidence(&kernel_eval, &self.agents, self.enzyme.config());
         DiscoveryResponse {
-            results,
+            results: candidates.into_iter().map(|c| c.into_result()).collect(),
             confidence,
             recommended_parallelism,
         }
     }
 
-    /// Derive confidence from kernel evaluation top picks.
-    fn derive_confidence(&self, kernel_eval: &KernelEvaluation) -> (DiscoveryConfidence, usize) {
-        let top_picks = &kernel_eval.top_picks;
-        if top_picks.is_empty() {
-            return (DiscoveryConfidence::Unanimous, 1);
-        }
+    // -----------------------------------------------------------------------
+    // Discovery (Query algebra)
+    // -----------------------------------------------------------------------
 
-        // Count votes per hypha.
-        let mut votes: BTreeMap<&HyphaId, usize> = BTreeMap::new();
-        for (_, hid) in top_picks {
-            *votes.entry(hid).or_insert(0) += 1;
-        }
-
-        let total = top_picks.len();
-        let (best_hid, best_count) = votes
-            .iter()
-            .max_by_key(|(_, c)| *c)
-            .map(|(h, c)| (*h, *c))
-            .unwrap();
-
-        if best_count == total {
-            // All kernels agree.
-            (DiscoveryConfidence::Unanimous, 1)
-        } else if best_count * 2 >= total {
-            // Majority agrees — find the dissenter.
-            let dissenting_kernel = top_picks
-                .iter()
-                .find(|(_, hid)| hid != best_hid)
-                .map(|(kt, _)| *kt)
-                .unwrap_or(KernelType::NoveltySeeking);
-            (DiscoveryConfidence::Majority { dissenting_kernel }, 1)
-        } else {
-            // No majority — split.
-            let hypha_to_name: HashMap<&HyphaId, &str> = self
-                .agents
-                .iter()
-                .map(|(name, record)| (&record.hypha.id, name.as_str()))
-                .collect();
-
-            let alternative_agents: Vec<String> = votes
-                .keys()
-                .filter(|hid| **hid != best_hid)
-                .filter_map(|hid| hypha_to_name.get(hid).map(|s| s.to_string()))
-                .collect();
-
-            let distinct_picks = votes.len();
-            let max_split = self.enzyme.config().max_disagreement_split;
-            let parallelism = distinct_picks.min(max_split);
-            (
-                DiscoveryConfidence::Split { alternative_agents },
-                parallelism,
-            )
-        }
-    }
-
-    /// Shared discovery pipeline: enzyme evaluation, scoring, feedback, tie-breaking, filtering.
-    fn discover_core(
+    /// Discover agents using a composable Query expression.
+    ///
+    /// The Query is evaluated against the scorer to produce per-agent
+    /// similarity scores, then fed into the standard discovery pipeline
+    /// (enzyme evaluation, feedback, tie-breaking, filtering).
+    pub fn discover_query(
         &mut self,
-        query: &str,
+        query: &crate::query::Query,
         filters: Option<&Filters>,
-    ) -> (Vec<ScoredCandidate>, KernelEvaluation) {
-        if self.agents.is_empty() {
-            return (
-                Vec::new(),
-                KernelEvaluation {
-                    agent_scores: HashMap::new(),
-                    top_picks: Vec::new(),
-                },
-            );
-        }
-
-        let query_sig = compute_query_signature(query.as_bytes(), &self.lsh_config);
-
-        // Build signal and collect hyphae for enzyme evaluation.
-        let signal = Signal::Tendril(Tendril {
-            trail_id: TrailId([0u8; 32]),
-            query_signature: query_sig.clone(),
-            query_config: QueryConfig::default(),
-        });
-        let hyphae: Vec<&Hypha> = self.agents.values().map(|r| &r.hypha).collect();
-
-        // Run enzyme evaluation BEFORE scoring — enzyme now drives ranking.
-        let kernel_eval = self.enzyme.evaluate_with_scores(&signal, &hyphae);
-
-        // Get raw scores from the scorer.
-        let raw_scores = match self.scorer.score(query) {
+    ) -> Vec<DiscoveryResult> {
+        let score_map = match query.evaluate(self.scorer.scorer()) {
             Ok(scores) => scores,
             Err(e) => {
-                eprintln!("alps-discovery: scorer.score() error: {}", e);
-                return (Vec::new(), kernel_eval);
+                eprintln!("alps-discovery: query.evaluate() error: {}", e);
+                return Vec::new();
             }
         };
-        let score_map: HashMap<String, f64> = raw_scores.into_iter().collect();
-
-        // Build a map from agent name to hypha_id for enzyme score lookup.
-        let name_to_hypha: HashMap<&str, &HyphaId> = self
-            .agents
-            .iter()
-            .map(|(name, record)| (name.as_str(), &record.hypha.id))
-            .collect();
-
-        // Build lightweight references — no cloning yet.
-        let mut refs: Vec<CandidateRef<'_>> = self
-            .agents
-            .iter()
-            .filter_map(|(name, record)| {
-                let sim = score_map.get(name.as_str()).copied().unwrap_or(0.0);
-                if sim < self.lsh_config.similarity_threshold {
-                    return None;
-                }
-
-                let feedback_factor = Self::compute_feedback_factor(
-                    &record.feedback,
-                    &query_sig.minhash,
-                    self.lsh_config.similarity_threshold,
-                );
-
-                // Look up enzyme score for this agent.
-                let enzyme_score = name_to_hypha
-                    .get(name.as_str())
-                    .and_then(|hid| kernel_eval.agent_scores.get(*hid))
-                    .copied()
-                    .unwrap_or(0.0);
-
-                // New formula: raw_similarity × (0.5 + 0.5 × enzyme_score) × (1.0 + feedback_factor × FEEDBACK_STRENGTH)
-                let score =
-                    sim * (0.5 + 0.5 * enzyme_score) * (1.0 + feedback_factor * FEEDBACK_STRENGTH);
-
-                Some(CandidateRef {
-                    agent_name: name.as_str(),
-                    raw_similarity: sim,
-                    diameter: record.hypha.state.diameter,
-                    enzyme_score,
-                    feedback_factor,
-                    final_score: score,
-                    endpoint: &record.endpoint,
-                    metadata: &record.metadata,
-                })
-            })
-            .collect();
-
-        // Apply metadata filters before sorting (avoids sorting filtered-out items).
-        if let Some(filters) = filters {
-            refs.retain(|r| {
-                filters
-                    .iter()
-                    .all(|(key, filter)| match r.metadata.get(key) {
-                        Some(value) => filter.matches(value),
-                        None => false,
-                    })
-            });
-        }
-
-        refs.sort_by(|a, b| {
-            b.final_score
-                .partial_cmp(&a.final_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        // Randomized tie-breaking: shuffle agents within 5% of top score.
-        if refs.len() > 1 {
-            let top_score = refs[0].final_score;
-            let tie_threshold = top_score * 0.95;
-            let tie_count = refs
-                .iter()
-                .take_while(|r| r.final_score >= tie_threshold)
-                .count();
-            if tie_count > 1 {
-                use std::time::SystemTime;
-                use xxhash_rust::xxh3::xxh3_64_with_seed;
-                let time_seed = SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .map(|d| d.as_nanos() as u64)
-                    .unwrap_or(0);
-                let base_seed = xxh3_64_with_seed(query.as_bytes(), time_seed);
-
-                let tie_slice = &mut refs[..tie_count];
-                for i in (1..tie_slice.len()).rev() {
-                    let j_seed = base_seed.wrapping_add(i as u64);
-                    let j = (xxh3_64_with_seed(&i.to_le_bytes(), j_seed) as usize) % (i + 1);
-                    tie_slice.swap(i, j);
-                }
-            }
-        }
-
-        // Promote survivors to owned ScoredCandidate (clone only here).
-        let results: Vec<ScoredCandidate> = refs
-            .into_iter()
-            .map(|r| ScoredCandidate {
-                agent_name: r.agent_name.to_string(),
-                raw_similarity: r.raw_similarity,
-                diameter: r.diameter,
-                enzyme_score: r.enzyme_score,
-                feedback_factor: r.feedback_factor,
-                final_score: r.final_score,
-                endpoint: r.endpoint.clone(),
-                metadata: r.metadata.clone(),
-            })
-            .collect();
-
-        // Run the enzyme process to update internal state (feeds LoadBalancingKernel).
-        let decision = self
-            .enzyme
-            .process(&signal, &self.spore, &hyphae, &self.membrane_state);
-
-        // Update forwards_count for the enzyme's pick.
-        let picked = match &decision.action {
-            EnzymeAction::Forward { target } => vec![target.clone()],
-            EnzymeAction::Split { targets } => targets.clone(),
-            _ => vec![],
-        };
-        for hypha_id in &picked {
-            for record in self.agents.values_mut() {
-                if record.hypha.id == *hypha_id {
-                    record.hypha.state.forwards_count += 1;
-                }
-            }
-        }
-
-        (results, kernel_eval)
+        let primary = query.primary_text().unwrap_or("");
+        let (candidates, _) = run_pipeline_with_scores(
+            &mut self.agents,
+            &self.scorer,
+            &mut self.enzyme,
+            primary,
+            score_map,
+            filters,
+        );
+        candidates.into_iter().map(|c| c.into_result()).collect()
     }
+
+    /// Discover agents using a Query with full scoring breakdown.
+    pub fn discover_query_explained(
+        &mut self,
+        query: &crate::query::Query,
+        filters: Option<&Filters>,
+    ) -> Vec<ExplainedResult> {
+        let score_map = match query.evaluate(self.scorer.scorer()) {
+            Ok(scores) => scores,
+            Err(e) => {
+                eprintln!("alps-discovery: query.evaluate() error: {}", e);
+                return Vec::new();
+            }
+        };
+        let primary = query.primary_text().unwrap_or("");
+        let (candidates, _) = run_pipeline_with_scores(
+            &mut self.agents,
+            &self.scorer,
+            &mut self.enzyme,
+            primary,
+            score_map,
+            filters,
+        );
+        candidates.into_iter().map(|c| c.into_explained()).collect()
+    }
+
+    /// Discover agents using a Query with confidence signal.
+    pub fn discover_query_with_confidence(
+        &mut self,
+        query: &crate::query::Query,
+        filters: Option<&Filters>,
+    ) -> DiscoveryResponse {
+        let score_map = match query.evaluate(self.scorer.scorer()) {
+            Ok(scores) => scores,
+            Err(e) => {
+                eprintln!("alps-discovery: query.evaluate() error: {}", e);
+                return DiscoveryResponse {
+                    results: Vec::new(),
+                    confidence: DiscoveryConfidence::Unanimous,
+                    recommended_parallelism: 1,
+                };
+            }
+        };
+        let primary = query.primary_text().unwrap_or("");
+        let (candidates, kernel_eval) = run_pipeline_with_scores(
+            &mut self.agents,
+            &self.scorer,
+            &mut self.enzyme,
+            primary,
+            score_map,
+            filters,
+        );
+        let (confidence, recommended_parallelism) =
+            derive_confidence(&kernel_eval, &self.agents, self.enzyme.config());
+        DiscoveryResponse {
+            results: candidates.into_iter().map(|c| c.into_result()).collect(),
+            confidence,
+            recommended_parallelism,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Feedback
+    // -----------------------------------------------------------------------
 
     /// Record a successful interaction with an agent.
     ///
@@ -723,26 +337,7 @@ impl LocalNetwork {
     ///
     /// Global diameter adjustment always applies regardless of query.
     pub fn record_success(&mut self, agent_name: &str, query: Option<&str>) {
-        if let Some(record) = self.agents.get_mut(agent_name) {
-            // Global boost (always). Floor prevents zero-trap absorbing state.
-            record.hypha.state.tau = (record.hypha.state.tau + 0.05).max(TAU_FLOOR);
-            record.hypha.state.sigma += 0.01;
-            record.hypha.state.diameter = (record.hypha.state.diameter + 0.01).min(1.0);
-            record.hypha.state.consecutive_pulse_timeouts = 0;
-            record.hypha.last_activity = Instant::now();
-
-            // Per-query-type feedback (if query provided).
-            if let Some(q) = query {
-                let sig = compute_query_signature(q.as_bytes(), &self.lsh_config);
-                record.feedback.push_back(FeedbackRecord {
-                    query_minhash: sig.minhash,
-                    outcome: 1.0,
-                });
-                if record.feedback.len() > MAX_FEEDBACK_RECORDS {
-                    record.feedback.pop_front();
-                }
-            }
-        }
+        registry::record_success(&mut self.agents, &self.scorer.lsh_config, agent_name, query);
     }
 
     /// Record a failed interaction with an agent.
@@ -751,60 +346,12 @@ impl LocalNetwork {
     /// queries similar to this one penalize the agent's ranking — without
     /// affecting unrelated query types.
     pub fn record_failure(&mut self, agent_name: &str, query: Option<&str>) {
-        if let Some(record) = self.agents.get_mut(agent_name) {
-            // Global penalty (always).
-            record.hypha.state.consecutive_pulse_timeouts = record
-                .hypha
-                .state
-                .consecutive_pulse_timeouts
-                .saturating_add(1);
-            record.hypha.state.diameter = (record.hypha.state.diameter - 0.05).max(0.1);
-
-            // Per-query-type feedback (if query provided).
-            if let Some(q) = query {
-                let sig = compute_query_signature(q.as_bytes(), &self.lsh_config);
-                record.feedback.push_back(FeedbackRecord {
-                    query_minhash: sig.minhash,
-                    outcome: -1.0,
-                });
-                if record.feedback.len() > MAX_FEEDBACK_RECORDS {
-                    record.feedback.pop_front();
-                }
-            }
-        }
+        registry::record_failure(&mut self.agents, &self.scorer.lsh_config, agent_name, query);
     }
 
-    /// Compute per-query feedback factor for an agent.
-    ///
-    /// Returns a value in [-1.0, 1.0] representing how well this agent has
-    /// performed on queries similar to the current one. 0.0 means no relevant
-    /// feedback exists.
-    fn compute_feedback_factor(
-        feedback: &VecDeque<FeedbackRecord>,
-        query_minhash: &[u8; 64],
-        relevance_threshold: f64,
-    ) -> f64 {
-        if feedback.is_empty() {
-            return 0.0;
-        }
-
-        let mut weighted_sum = 0.0;
-        let mut weight_sum = 0.0;
-
-        for fb in feedback {
-            let relevance = MinHasher::similarity(&fb.query_minhash, query_minhash);
-            if relevance >= relevance_threshold {
-                weighted_sum += relevance * fb.outcome;
-                weight_sum += relevance;
-            }
-        }
-
-        if weight_sum > 0.0 {
-            (weighted_sum / weight_sum).clamp(-1.0, 1.0)
-        } else {
-            0.0
-        }
-    }
+    // -----------------------------------------------------------------------
+    // Temporal decay
+    // -----------------------------------------------------------------------
 
     /// Apply temporal decay to all agent pheromone state.
     ///
@@ -814,13 +361,12 @@ impl LocalNetwork {
     /// Diameter is not decayed — it represents structural capacity, not
     /// an ephemeral signal.
     pub fn tick(&mut self) {
-        for record in self.agents.values_mut() {
-            let s = &mut record.hypha.state;
-            s.tau = (s.tau * 0.995).max(TAU_FLOOR);
-            s.sigma *= 0.99;
-            // diameter stays — structural capacity, not ephemeral signal.
-        }
+        registry::tick(&mut self.agents);
     }
+
+    // -----------------------------------------------------------------------
+    // Introspection
+    // -----------------------------------------------------------------------
 
     /// Returns the number of registered agents.
     pub fn agent_count(&self) -> usize {
@@ -833,16 +379,14 @@ impl LocalNetwork {
     }
 
     /// Deterministically convert an agent name to a HyphaId.
-    fn name_to_hypha_id(name: &str) -> HyphaId {
-        use xxhash_rust::xxh3::xxh3_64_with_seed;
-        let mut id = [0u8; 32];
-        for i in 0..4u64 {
-            let hash = xxh3_64_with_seed(name.as_bytes(), i);
-            let offset = (i as usize) * 8;
-            id[offset..offset + 8].copy_from_slice(&hash.to_le_bytes());
-        }
-        HyphaId(id)
+    #[cfg(test)]
+    fn name_to_hypha_id(name: &str) -> crate::core::types::HyphaId {
+        registry::name_to_hypha_id(name)
     }
+
+    // -----------------------------------------------------------------------
+    // Persistence
+    // -----------------------------------------------------------------------
 
     /// Save the network state to a JSON file.
     ///
@@ -853,39 +397,7 @@ impl LocalNetwork {
     /// `Hypha.last_activity` (an `Instant`) is NOT serialized — it resets
     /// to `Instant::now()` on load.
     pub fn save(&self, path: &str) -> Result<(), NetworkError> {
-        let snapshot = NetworkSnapshot {
-            version: Self::SNAPSHOT_VERSION,
-            agents: self
-                .agents
-                .iter()
-                .map(|(name, record)| {
-                    let feedback: Vec<FeedbackSnapshot> = record
-                        .feedback
-                        .iter()
-                        .map(|fb| FeedbackSnapshot {
-                            query_minhash: fb.query_minhash,
-                            outcome: fb.outcome,
-                        })
-                        .collect();
-                    AgentSnapshot {
-                        name: name.clone(),
-                        capabilities: record.capabilities.clone(),
-                        endpoint: record.endpoint.clone(),
-                        metadata: record.metadata.clone(),
-                        diameter: record.hypha.state.diameter,
-                        tau: record.hypha.state.tau,
-                        sigma: record.hypha.state.sigma,
-                        omega: record.hypha.state.omega,
-                        forwards_count: record.hypha.state.forwards_count,
-                        consecutive_pulse_timeouts: record.hypha.state.consecutive_pulse_timeouts,
-                        feedback,
-                    }
-                })
-                .collect(),
-        };
-        let json = serde_json::to_string_pretty(&snapshot)?;
-        std::fs::write(path, json)?;
-        Ok(())
+        persistence::save_snapshot(&self.agents, path)
     }
 
     /// Load network state from a JSON file.
@@ -895,23 +407,12 @@ impl LocalNetwork {
     ///
     /// Uses the default MinHash scorer. For custom scorers, load then
     /// reconfigure.
-    /// Current snapshot schema version.
-    const SNAPSHOT_VERSION: u32 = 1;
-
     pub fn load(path: &str) -> Result<Self, NetworkError> {
-        let json = std::fs::read_to_string(path)?;
-        let snapshot: NetworkSnapshot = serde_json::from_str(&json)?;
-
-        if snapshot.version > Self::SNAPSHOT_VERSION {
-            return Err(NetworkError::UnsupportedVersion {
-                found: snapshot.version,
-                supported: Self::SNAPSHOT_VERSION,
-            });
-        }
+        let agents_data = persistence::load_snapshot(path)?;
 
         let mut network = Self::new();
 
-        for agent in snapshot.agents {
+        for agent in agents_data {
             let caps: Vec<&str> = agent.capabilities.iter().map(|s| s.as_str()).collect();
             network.register(
                 &agent.name,
@@ -921,25 +422,13 @@ impl LocalNetwork {
             );
 
             // Restore scoring state (register() sets defaults, so override).
-            // Enforce TAU_FLOOR for backward compat with snapshots that had tau=0.
             if let Some(record) = network.agents.get_mut(&agent.name) {
                 record.hypha.state.diameter = agent.diameter;
-                record.hypha.state.tau = agent.tau.max(TAU_FLOOR);
+                record.hypha.state.tau = agent.tau;
                 record.hypha.state.sigma = agent.sigma;
-                record.hypha.state.omega = agent.omega;
                 record.hypha.state.forwards_count = agent.forwards_count;
                 record.hypha.state.consecutive_pulse_timeouts = agent.consecutive_pulse_timeouts;
-
-                // Restore feedback history, capped at MAX_FEEDBACK_RECORDS.
-                let feedback_iter = agent.feedback.into_iter().map(|fb| FeedbackRecord {
-                    query_minhash: fb.query_minhash,
-                    outcome: fb.outcome,
-                });
-                let mut feedback: VecDeque<FeedbackRecord> = feedback_iter.collect();
-                while feedback.len() > MAX_FEEDBACK_RECORDS {
-                    feedback.pop_front();
-                }
-                record.feedback = feedback;
+                record.feedback = agent.feedback;
             }
         }
 
@@ -956,6 +445,8 @@ impl Default for LocalNetwork {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pipeline::FEEDBACK_STRENGTH;
+    use registry::TAU_FLOOR;
 
     /// Helper: register with no endpoint/metadata.
     fn reg(network: &mut LocalNetwork, name: &str, caps: &[&str]) {
@@ -1730,7 +1221,7 @@ mod tests {
                 err,
                 NetworkError::UnsupportedVersion {
                     found: 99,
-                    supported: 1
+                    supported: 2
                 }
             ),
             "expected UnsupportedVersion, got: {:?}",
@@ -2351,5 +1842,142 @@ mod tests {
             config.dimensions, 64,
             "default dimensions should equal SIGNATURE_SIZE"
         );
+    }
+
+    // --- Query algebra integration tests ---
+
+    #[test]
+    fn discover_query_text_matches_string_discover() {
+        let mut network = LocalNetwork::new();
+        reg(&mut network, "translate", &["legal translation", "EN-DE"]);
+        reg(&mut network, "summarize", &["document summarization"]);
+
+        let str_results = network.discover("legal translation");
+        let query = crate::query::Query::Text("legal translation".to_string());
+        let q_results = network.discover_query(&query, None);
+
+        assert_eq!(str_results.len(), q_results.len());
+        for (s, q) in str_results.iter().zip(q_results.iter()) {
+            assert_eq!(s.agent_name, q.agent_name);
+            assert!((s.similarity - q.similarity).abs() < 1e-10);
+        }
+    }
+
+    #[test]
+    fn discover_query_all_narrows_results() {
+        let mut network = LocalNetwork::new();
+        reg(
+            &mut network,
+            "translate",
+            &["legal translation", "German language"],
+        );
+        reg(&mut network, "summarize", &["document summarization"]);
+
+        let query = crate::query::Query::all(["legal translation", "German language"]);
+        let results = network.discover_query(&query, None);
+
+        // translate matches both, summarize should score lower or be absent
+        let translate_score = results
+            .iter()
+            .find(|r| r.agent_name == "translate")
+            .map(|r| r.score);
+        let summarize_score = results
+            .iter()
+            .find(|r| r.agent_name == "summarize")
+            .map(|r| r.score)
+            .unwrap_or(0.0);
+
+        assert!(
+            translate_score.is_some(),
+            "translate should appear in All results"
+        );
+        assert!(
+            translate_score.unwrap() > summarize_score,
+            "translate ({:.3}) should outscore summarize ({:.3})",
+            translate_score.unwrap(),
+            summarize_score
+        );
+    }
+
+    #[test]
+    fn discover_query_any_widens_results() {
+        let mut network = LocalNetwork::new();
+        reg(&mut network, "translate", &["legal translation"]);
+        reg(&mut network, "summarize", &["document summarization"]);
+
+        let query = crate::query::Query::any(["legal translation", "document summarization"]);
+        let results = network.discover_query(&query, None);
+
+        // Both should appear
+        assert!(
+            results.iter().any(|r| r.agent_name == "translate"),
+            "translate should appear in Any results"
+        );
+        assert!(
+            results.iter().any(|r| r.agent_name == "summarize"),
+            "summarize should appear in Any results"
+        );
+    }
+
+    #[test]
+    fn discover_query_exclude_penalises() {
+        let mut network = LocalNetwork::new();
+        reg(&mut network, "general-translate", &["translation services"]);
+        reg(
+            &mut network,
+            "medical-translate",
+            &["medical translation", "medical records"],
+        );
+
+        // Without exclusion
+        let base_results = network.discover("translation services");
+        let base_medical = base_results
+            .iter()
+            .find(|r| r.agent_name == "medical-translate")
+            .map(|r| r.score)
+            .unwrap_or(0.0);
+
+        // With exclusion
+        let query = crate::query::Query::from("translation services").exclude("medical records");
+        let exc_results = network.discover_query(&query, None);
+        let exc_medical = exc_results
+            .iter()
+            .find(|r| r.agent_name == "medical-translate")
+            .map(|r| r.score)
+            .unwrap_or(0.0);
+
+        assert!(
+            exc_medical < base_medical,
+            "medical-translate with exclusion ({:.3}) should score lower than without ({:.3})",
+            exc_medical,
+            base_medical
+        );
+    }
+
+    #[test]
+    fn discover_query_with_confidence_works() {
+        let mut network = LocalNetwork::new();
+        reg(&mut network, "translate", &["legal translation"]);
+        reg(&mut network, "summarize", &["document summarization"]);
+
+        let query = crate::query::Query::any(["legal translation", "document summarization"]);
+        let resp = network.discover_query_with_confidence(&query, None);
+
+        assert!(!resp.results.is_empty());
+        assert!(resp.recommended_parallelism >= 1);
+    }
+
+    #[test]
+    fn discover_query_explained_works() {
+        let mut network = LocalNetwork::new();
+        reg(&mut network, "translate", &["legal translation"]);
+
+        let query = crate::query::Query::from("legal translation");
+        let results = network.discover_query_explained(&query, None);
+
+        assert!(!results.is_empty());
+        assert_eq!(results[0].agent_name, "translate");
+        assert!(results[0].raw_similarity > 0.0);
+        assert!(results[0].enzyme_score >= 0.0);
     }
 }

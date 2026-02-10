@@ -183,7 +183,7 @@ impl PyLocalNetwork {
     fn discover(
         &mut self,
         py: Python<'_>,
-        query: &str,
+        query: Py<PyAny>,
         filters: Option<HashMap<String, Py<PyAny>>>,
         explain: bool,
         with_confidence: bool,
@@ -199,84 +199,18 @@ impl PyLocalNetwork {
             None
         };
 
-        if explain {
-            let results: Vec<PyExplainedResult> = self
-                .inner
-                .discover_explained(query, rust_filters.as_ref())
-                .into_iter()
-                .map(|r| PyExplainedResult {
-                    agent_name: r.agent_name,
-                    raw_similarity: r.raw_similarity,
-                    diameter: r.diameter,
-                    enzyme_score: r.enzyme_score,
-                    feedback_factor: r.feedback_factor,
-                    final_score: r.final_score,
-                    endpoint: r.endpoint,
-                    metadata: r.metadata,
-                })
-                .collect();
-            Ok(results.into_pyobject(py)?.into_any().unbind())
-        } else if with_confidence {
-            let resp = self
-                .inner
-                .discover_with_confidence_filtered(query, rust_filters.as_ref());
+        // Accept either a str or a Query object.
+        let bound = query.bind(py);
+        let is_query = bound.extract::<PyQuery>().is_ok();
 
-            let stored: Vec<StoredResult> = resp
-                .results
-                .into_iter()
-                .map(|r| {
-                    let invoke = self.invocables.get(&r.agent_name).map(|f| f.clone_ref(py));
-                    StoredResult {
-                        agent_name: r.agent_name,
-                        similarity: r.similarity,
-                        score: r.score,
-                        endpoint: r.endpoint,
-                        metadata: r.metadata,
-                        invoke,
-                    }
-                })
-                .collect();
-
-            let (confidence_str, dissenting_kernel, alternative_agents) = match &resp.confidence {
-                crate::network::DiscoveryConfidence::Unanimous => {
-                    ("unanimous".to_string(), None, Vec::new())
-                }
-                crate::network::DiscoveryConfidence::Majority { dissenting_kernel } => (
-                    "majority".to_string(),
-                    Some(dissenting_kernel.to_string()),
-                    Vec::new(),
-                ),
-                crate::network::DiscoveryConfidence::Split { alternative_agents } => {
-                    ("split".to_string(), None, alternative_agents.clone())
-                }
-            };
-
-            let py_resp = PyDiscoveryResponse {
-                stored_results: stored,
-                confidence: confidence_str,
-                dissenting_kernel,
-                alternative_agents,
-                recommended_parallelism: resp.recommended_parallelism,
-            };
-            Ok(py_resp.into_pyobject(py)?.into_any().unbind())
+        if is_query {
+            let rust_query = bound.extract::<PyQuery>()?.inner;
+            self.discover_with_query(py, &rust_query, rust_filters, explain, with_confidence)
         } else {
-            let results: Vec<PyDiscoveryResult> = self
-                .inner
-                .discover_filtered(query, rust_filters.as_ref())
-                .into_iter()
-                .map(|r| {
-                    let invoke = self.invocables.get(&r.agent_name).map(|f| f.clone_ref(py));
-                    PyDiscoveryResult {
-                        agent_name: r.agent_name,
-                        similarity: r.similarity,
-                        score: r.score,
-                        endpoint: r.endpoint,
-                        metadata: r.metadata,
-                        invoke,
-                    }
-                })
-                .collect();
-            Ok(results.into_pyobject(py)?.into_any().unbind())
+            let query_str: String = bound.extract().map_err(|_| {
+                pyo3::exceptions::PyTypeError::new_err("query must be a str or Query object")
+            })?;
+            self.discover_with_string(py, &query_str, rust_filters, explain, with_confidence)
         }
     }
 
@@ -321,6 +255,8 @@ impl PyLocalNetwork {
                         .map(|r| PyExplainedResult {
                             agent_name: r.agent_name,
                             raw_similarity: r.raw_similarity,
+                            similarity_lower: r.similarity_ci.lower_bound,
+                            similarity_upper: r.similarity_ci.upper_bound,
                             diameter: r.diameter,
                             enzyme_score: r.enzyme_score,
                             feedback_factor: r.feedback_factor,
@@ -468,6 +404,160 @@ impl PyLocalNetwork {
         let s: String = value.extract()?;
         Ok(crate::network::FilterValue::Exact(s))
     }
+
+    /// Discovery implementation for string queries.
+    fn discover_with_string(
+        &mut self,
+        py: Python<'_>,
+        query: &str,
+        rust_filters: Option<crate::network::Filters>,
+        explain: bool,
+        with_confidence: bool,
+    ) -> PyResult<Py<PyAny>> {
+        if explain {
+            let results: Vec<PyExplainedResult> = self
+                .inner
+                .discover_explained(query, rust_filters.as_ref())
+                .into_iter()
+                .map(|r| PyExplainedResult {
+                    agent_name: r.agent_name,
+                    raw_similarity: r.raw_similarity,
+                    similarity_lower: r.similarity_ci.lower_bound,
+                    similarity_upper: r.similarity_ci.upper_bound,
+                    diameter: r.diameter,
+                    enzyme_score: r.enzyme_score,
+                    feedback_factor: r.feedback_factor,
+                    final_score: r.final_score,
+                    endpoint: r.endpoint,
+                    metadata: r.metadata,
+                })
+                .collect();
+            Ok(results.into_pyobject(py)?.into_any().unbind())
+        } else if with_confidence {
+            let resp = self
+                .inner
+                .discover_with_confidence_filtered(query, rust_filters.as_ref());
+            self.build_confidence_response(py, resp)
+        } else {
+            let results: Vec<PyDiscoveryResult> = self
+                .inner
+                .discover_filtered(query, rust_filters.as_ref())
+                .into_iter()
+                .map(|r| {
+                    let invoke = self.invocables.get(&r.agent_name).map(|f| f.clone_ref(py));
+                    PyDiscoveryResult {
+                        agent_name: r.agent_name,
+                        similarity: r.similarity,
+                        score: r.score,
+                        endpoint: r.endpoint,
+                        metadata: r.metadata,
+                        invoke,
+                    }
+                })
+                .collect();
+            Ok(results.into_pyobject(py)?.into_any().unbind())
+        }
+    }
+
+    /// Discovery implementation for Query algebra objects.
+    fn discover_with_query(
+        &mut self,
+        py: Python<'_>,
+        query: &crate::query::Query,
+        rust_filters: Option<crate::network::Filters>,
+        explain: bool,
+        with_confidence: bool,
+    ) -> PyResult<Py<PyAny>> {
+        if explain {
+            let results: Vec<PyExplainedResult> = self
+                .inner
+                .discover_query_explained(query, rust_filters.as_ref())
+                .into_iter()
+                .map(|r| PyExplainedResult {
+                    agent_name: r.agent_name,
+                    raw_similarity: r.raw_similarity,
+                    similarity_lower: r.similarity_ci.lower_bound,
+                    similarity_upper: r.similarity_ci.upper_bound,
+                    diameter: r.diameter,
+                    enzyme_score: r.enzyme_score,
+                    feedback_factor: r.feedback_factor,
+                    final_score: r.final_score,
+                    endpoint: r.endpoint,
+                    metadata: r.metadata,
+                })
+                .collect();
+            Ok(results.into_pyobject(py)?.into_any().unbind())
+        } else if with_confidence {
+            let resp = self
+                .inner
+                .discover_query_with_confidence(query, rust_filters.as_ref());
+            self.build_confidence_response(py, resp)
+        } else {
+            let results: Vec<PyDiscoveryResult> = self
+                .inner
+                .discover_query(query, rust_filters.as_ref())
+                .into_iter()
+                .map(|r| {
+                    let invoke = self.invocables.get(&r.agent_name).map(|f| f.clone_ref(py));
+                    PyDiscoveryResult {
+                        agent_name: r.agent_name,
+                        similarity: r.similarity,
+                        score: r.score,
+                        endpoint: r.endpoint,
+                        metadata: r.metadata,
+                        invoke,
+                    }
+                })
+                .collect();
+            Ok(results.into_pyobject(py)?.into_any().unbind())
+        }
+    }
+
+    /// Build a PyDiscoveryResponse from a Rust DiscoveryResponse.
+    fn build_confidence_response(
+        &self,
+        py: Python<'_>,
+        resp: crate::network::DiscoveryResponse,
+    ) -> PyResult<Py<PyAny>> {
+        let stored: Vec<StoredResult> = resp
+            .results
+            .into_iter()
+            .map(|r| {
+                let invoke = self.invocables.get(&r.agent_name).map(|f| f.clone_ref(py));
+                StoredResult {
+                    agent_name: r.agent_name,
+                    similarity: r.similarity,
+                    score: r.score,
+                    endpoint: r.endpoint,
+                    metadata: r.metadata,
+                    invoke,
+                }
+            })
+            .collect();
+
+        let (confidence_str, dissenting_kernel, alternative_agents) = match &resp.confidence {
+            crate::network::DiscoveryConfidence::Unanimous => {
+                ("unanimous".to_string(), None, Vec::new())
+            }
+            crate::network::DiscoveryConfidence::Majority { dissenting_kernel } => (
+                "majority".to_string(),
+                Some(dissenting_kernel.to_string()),
+                Vec::new(),
+            ),
+            crate::network::DiscoveryConfidence::Split { alternative_agents } => {
+                ("split".to_string(), None, alternative_agents.clone())
+            }
+        };
+
+        let py_resp = PyDiscoveryResponse {
+            stored_results: stored,
+            confidence: confidence_str,
+            dissenting_kernel,
+            alternative_agents,
+            recommended_parallelism: resp.recommended_parallelism,
+        };
+        Ok(py_resp.into_pyobject(py)?.into_any().unbind())
+    }
 }
 
 /// A single discovery result.
@@ -526,6 +616,10 @@ pub struct PyExplainedResult {
     #[pyo3(get)]
     pub raw_similarity: f64,
     #[pyo3(get)]
+    pub similarity_lower: f64,
+    #[pyo3(get)]
+    pub similarity_upper: f64,
+    #[pyo3(get)]
     pub diameter: f64,
     #[pyo3(get)]
     pub enzyme_score: f64,
@@ -543,9 +637,11 @@ pub struct PyExplainedResult {
 impl PyExplainedResult {
     fn __repr__(&self) -> String {
         format!(
-            "ExplainedResult(agent='{}', sim={:.3}, diameter={:.3}, enzyme={:.3}, feedback={:.3}, score={:.3})",
+            "ExplainedResult(agent='{}', sim={:.3} [{:.3}, {:.3}], diameter={:.3}, enzyme={:.3}, feedback={:.3}, score={:.3})",
             self.agent_name,
             self.raw_similarity,
+            self.similarity_lower,
+            self.similarity_upper,
             self.diameter,
             self.enzyme_score,
             self.feedback_factor,
@@ -665,5 +761,118 @@ impl PyDiscoveryResponseIter {
 
     fn __next__(&mut self) -> Option<Py<PyAny>> {
         self.inner.next()
+    }
+}
+
+/// Composable query expression for agent discovery.
+///
+/// Supports set-theoretic composition of text queries:
+///
+/// - ``Query.all("legal translation", "German language")``
+///   — agent must match ALL terms (min similarity)
+/// - ``Query.any("translate", "interpret")``
+///   — agent can match ANY term (max similarity)
+/// - ``Query.all("translate").exclude("medical")``
+///   — match but penalise unwanted matches
+/// - ``Query.weighted({"translate": 2.0, "legal": 1.0})``
+///   — weighted combination
+///
+/// Pass a Query to ``network.discover()`` in place of a string.
+#[pyclass(name = "Query")]
+#[derive(Clone)]
+pub struct PyQuery {
+    pub(crate) inner: crate::query::Query,
+}
+
+#[pymethods]
+impl PyQuery {
+    /// Create an All query (AND semantics).
+    ///
+    /// Agent must match ALL sub-queries. Score = min across sub-queries.
+    ///
+    /// Args:
+    ///     *queries: Text strings or Query objects.
+    #[staticmethod]
+    #[pyo3(signature = (*queries))]
+    fn all(queries: Vec<Py<PyAny>>, py: Python<'_>) -> PyResult<Self> {
+        let inner_queries = Self::parse_query_args(queries, py)?;
+        Ok(PyQuery {
+            inner: crate::query::Query::All(inner_queries),
+        })
+    }
+
+    /// Create an Any query (OR semantics).
+    ///
+    /// Agent can match ANY sub-query. Score = max across sub-queries.
+    ///
+    /// Args:
+    ///     *queries: Text strings or Query objects.
+    #[staticmethod]
+    #[pyo3(signature = (*queries))]
+    fn any(queries: Vec<Py<PyAny>>, py: Python<'_>) -> PyResult<Self> {
+        let inner_queries = Self::parse_query_args(queries, py)?;
+        Ok(PyQuery {
+            inner: crate::query::Query::Any(inner_queries),
+        })
+    }
+
+    /// Create a Weighted query (boosted combination).
+    ///
+    /// Score = weighted average of sub-query similarities.
+    ///
+    /// Args:
+    ///     mapping: Dict mapping query strings to weight floats.
+    #[staticmethod]
+    fn weighted(mapping: HashMap<String, f64>) -> Self {
+        let entries: Vec<(crate::query::Query, f64)> = mapping
+            .into_iter()
+            .map(|(text, weight)| (crate::query::Query::Text(text), weight))
+            .collect();
+        PyQuery {
+            inner: crate::query::Query::Weighted(entries),
+        }
+    }
+
+    /// Chain an exclusion onto this query.
+    ///
+    /// Agents matching the exclusion have their score reduced proportionally.
+    ///
+    /// Args:
+    ///     query: Text string or Query object to exclude.
+    fn exclude(&self, query: Py<PyAny>, py: Python<'_>) -> PyResult<Self> {
+        let exclusion = Self::parse_single_query(query, py)?;
+        Ok(PyQuery {
+            inner: self.inner.clone().exclude(exclusion),
+        })
+    }
+
+    fn __repr__(&self) -> String {
+        format!("Query({:?})", self.inner)
+    }
+}
+
+impl PyQuery {
+    /// Parse a single Python argument into a Rust Query.
+    fn parse_single_query(arg: Py<PyAny>, py: Python<'_>) -> PyResult<crate::query::Query> {
+        let bound = arg.bind(py);
+        if let Ok(pyq) = bound.extract::<PyQuery>() {
+            return Ok(pyq.inner);
+        }
+        if let Ok(s) = bound.extract::<String>() {
+            return Ok(crate::query::Query::Text(s));
+        }
+        Err(pyo3::exceptions::PyTypeError::new_err(
+            "Query argument must be a str or Query object",
+        ))
+    }
+
+    /// Parse a list of Python arguments into Rust Query objects.
+    fn parse_query_args(
+        args: Vec<Py<PyAny>>,
+        py: Python<'_>,
+    ) -> PyResult<Vec<crate::query::Query>> {
+        args.into_iter()
+            .map(|a| Self::parse_single_query(a, py))
+            .collect()
     }
 }

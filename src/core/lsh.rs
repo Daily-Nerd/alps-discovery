@@ -138,6 +138,53 @@ impl MinHasher {
         let matching = a.iter().zip(b.iter()).filter(|(x, y)| x == y).count();
         matching as f64 / SIGNATURE_SIZE as f64
     }
+
+    /// Computes similarity with a 95% confidence interval.
+    ///
+    /// MinHash similarity is a binomial estimator: each byte position is an
+    /// independent Bernoulli trial with probability = true Jaccard similarity.
+    /// The standard error is `sqrt(j * (1 - j) / n)` where `n = SIGNATURE_SIZE`.
+    ///
+    /// When the top-2 agents' confidence intervals overlap, their similarity
+    /// estimates are statistically indistinguishable — a principled replacement
+    /// for the hardcoded 5% tie-breaking threshold.
+    pub fn similarity_with_confidence(
+        a: &[u8; SIGNATURE_SIZE],
+        b: &[u8; SIGNATURE_SIZE],
+    ) -> ConfidenceInterval {
+        let matching = a.iter().zip(b.iter()).filter(|(x, y)| x == y).count();
+        let j = matching as f64 / SIGNATURE_SIZE as f64;
+        let se = (j * (1.0 - j) / SIGNATURE_SIZE as f64).sqrt();
+        ConfidenceInterval {
+            point_estimate: j,
+            lower_bound: (j - 1.96 * se).max(0.0),
+            upper_bound: (j + 1.96 * se).min(1.0),
+        }
+    }
+}
+
+/// 95% confidence interval for a Jaccard similarity estimate.
+///
+/// Based on the binomial standard error of MinHash: each of the 64 byte
+/// positions is an independent Bernoulli trial.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConfidenceInterval {
+    /// Point estimate of Jaccard similarity [0.0, 1.0].
+    pub point_estimate: f64,
+    /// Lower bound of 95% CI.
+    pub lower_bound: f64,
+    /// Upper bound of 95% CI.
+    pub upper_bound: f64,
+}
+
+impl ConfidenceInterval {
+    /// Returns true if this interval overlaps with another.
+    ///
+    /// Overlapping CIs indicate the two similarity estimates are statistically
+    /// indistinguishable at the 95% confidence level.
+    pub fn overlaps(&self, other: &ConfidenceInterval) -> bool {
+        self.lower_bound <= other.upper_bound && other.lower_bound <= self.upper_bound
+    }
 }
 
 /// Generates a QuerySignature from a byte key using the configured LSH family.
@@ -414,6 +461,131 @@ mod tests {
                     sim
                 );
             }
+        }
+    }
+
+    #[test]
+    fn confidence_interval_identical_inputs() {
+        let hasher = MinHasher::new(SIGNATURE_SIZE);
+        let sig = hasher.hash_key(b"legal translation services", &default_mode());
+        let ci = MinHasher::similarity_with_confidence(&sig, &sig);
+        assert_eq!(ci.point_estimate, 1.0);
+        // SE = sqrt(1.0 * 0.0 / 64) = 0, so bounds collapse to 1.0
+        assert_eq!(ci.lower_bound, 1.0);
+        assert_eq!(ci.upper_bound, 1.0);
+    }
+
+    #[test]
+    fn confidence_interval_bounds_contain_point_estimate() {
+        let hasher = MinHasher::new(SIGNATURE_SIZE);
+        let s1 = hasher.hash_key(b"translate legal document", &default_mode());
+        let s2 = hasher.hash_key(b"legal translation service", &default_mode());
+        let ci = MinHasher::similarity_with_confidence(&s1, &s2);
+        assert!(ci.lower_bound <= ci.point_estimate);
+        assert!(ci.point_estimate <= ci.upper_bound);
+        assert!(ci.lower_bound >= 0.0);
+        assert!(ci.upper_bound <= 1.0);
+    }
+
+    #[test]
+    fn confidence_interval_width_matches_formula() {
+        let hasher = MinHasher::new(SIGNATURE_SIZE);
+        let s1 = hasher.hash_key(b"translate legal document", &default_mode());
+        let s2 = hasher.hash_key(b"code review and testing", &default_mode());
+        let ci = MinHasher::similarity_with_confidence(&s1, &s2);
+        let j = ci.point_estimate;
+        let expected_se = (j * (1.0 - j) / SIGNATURE_SIZE as f64).sqrt();
+        let expected_lower = (j - 1.96 * expected_se).max(0.0);
+        let expected_upper = (j + 1.96 * expected_se).min(1.0);
+        assert!(
+            (ci.lower_bound - expected_lower).abs() < 1e-10,
+            "lower bound mismatch: {} vs {}",
+            ci.lower_bound,
+            expected_lower
+        );
+        assert!(
+            (ci.upper_bound - expected_upper).abs() < 1e-10,
+            "upper bound mismatch: {} vs {}",
+            ci.upper_bound,
+            expected_upper
+        );
+    }
+
+    #[test]
+    fn confidence_interval_overlaps_identical() {
+        let ci = ConfidenceInterval {
+            point_estimate: 0.5,
+            lower_bound: 0.38,
+            upper_bound: 0.62,
+        };
+        assert!(ci.overlaps(&ci), "interval should overlap with itself");
+    }
+
+    #[test]
+    fn confidence_interval_overlaps_adjacent() {
+        let ci1 = ConfidenceInterval {
+            point_estimate: 0.4,
+            lower_bound: 0.28,
+            upper_bound: 0.52,
+        };
+        let ci2 = ConfidenceInterval {
+            point_estimate: 0.5,
+            lower_bound: 0.38,
+            upper_bound: 0.62,
+        };
+        assert!(ci1.overlaps(&ci2), "overlapping CIs should report overlap");
+        assert!(ci2.overlaps(&ci1), "overlaps should be symmetric");
+    }
+
+    #[test]
+    fn confidence_interval_no_overlap_disjoint() {
+        let ci1 = ConfidenceInterval {
+            point_estimate: 0.2,
+            lower_bound: 0.10,
+            upper_bound: 0.30,
+        };
+        let ci2 = ConfidenceInterval {
+            point_estimate: 0.8,
+            lower_bound: 0.70,
+            upper_bound: 0.90,
+        };
+        assert!(!ci1.overlaps(&ci2), "disjoint CIs should not overlap");
+        assert!(!ci2.overlaps(&ci1), "no-overlap should be symmetric");
+    }
+
+    #[test]
+    fn confidence_interval_known_jaccard_coverage() {
+        // Construct two signatures with exactly k matching positions out of 64.
+        // The true Jaccard is k/64. The CI should contain k/64.
+        for k in [0, 10, 32, 50, 64] {
+            let mut a = [0u8; SIGNATURE_SIZE];
+            let mut b = [0u8; SIGNATURE_SIZE];
+            // First k positions match, rest differ
+            for i in 0..SIGNATURE_SIZE {
+                a[i] = i as u8;
+                b[i] = if i < k {
+                    i as u8
+                } else {
+                    (i as u8).wrapping_add(128)
+                };
+            }
+            let ci = MinHasher::similarity_with_confidence(&a, &b);
+            let true_jaccard = k as f64 / SIGNATURE_SIZE as f64;
+            assert!(
+                (ci.point_estimate - true_jaccard).abs() < 1e-10,
+                "k={}: point estimate {} != true Jaccard {}",
+                k,
+                ci.point_estimate,
+                true_jaccard
+            );
+            assert!(
+                ci.lower_bound <= true_jaccard && true_jaccard <= ci.upper_bound,
+                "k={}: CI [{}, {}] does not contain true Jaccard {}",
+                k,
+                ci.lower_bound,
+                ci.upper_bound,
+                true_jaccard
+            );
         }
     }
 

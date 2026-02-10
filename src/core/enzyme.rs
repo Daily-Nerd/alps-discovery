@@ -16,12 +16,15 @@ use crate::core::types::{DecisionId, HyphaId, KernelType};
 /// The core enzyme trait — sans-IO routing decision interface.
 pub trait Enzyme {
     /// Process a signal and return a routing decision.
+    ///
+    /// `scorer_context` provides pre-computed scorer similarities keyed by HyphaId.
     fn process(
         &mut self,
         signal: &Signal,
         spore: &Spore,
         hyphae: &[&Hypha],
         membrane: &MembraneState,
+        scorer_context: &ScorerContext,
     ) -> EnzymeDecision;
 }
 
@@ -32,25 +35,50 @@ pub struct KernelRecommendation {
     pub ranked: Vec<(HyphaId, f64)>,
 }
 
+/// Pre-computed scorer similarities keyed by HyphaId.
+///
+/// Passed to kernels so that CapabilityKernel can use the same similarity
+/// values the user sees, eliminating divergence between scorer and chemistry paths.
+pub type ScorerContext = HashMap<HyphaId, f64>;
+
 /// Individual reasoning kernel interface.
 ///
 /// Each kernel implements a different scoring strategy for hypha selection.
+/// The `scorer_context` provides pre-computed scorer similarities so that
+/// kernels can use the same values as the user-visible ranking.
 pub trait ReasoningKernel: Send + Sync {
     /// The kernel type identifier.
     fn kernel_type(&self) -> KernelType;
 
     /// Evaluate hyphae and return a ranked recommendation.
-    fn evaluate(&self, signal: &Signal, hyphae: &[&Hypha]) -> KernelRecommendation;
+    ///
+    /// `scorer_context` maps HyphaId → raw_similarity from the pluggable Scorer.
+    /// Kernels that need capability similarity (e.g. CapabilityKernel) should use
+    /// these values instead of Chemistry. Other kernels may ignore it.
+    fn evaluate(
+        &self,
+        signal: &Signal,
+        hyphae: &[&Hypha],
+        scorer_context: &ScorerContext,
+    ) -> KernelRecommendation;
 }
 
 // ---------------------------------------------------------------------------
 // Discovery kernels
 // ---------------------------------------------------------------------------
 
-/// Capability-matching kernel: scores hyphae by Chemistry similarity to the
-/// query signature. Primary kernel for discovery.
+/// Capability-matching kernel: scores hyphae by scorer similarity,
+/// weighted by diameter and tau reliability.
 ///
-/// Score: `similarity(hypha.chemistry, query_signature) * diameter`.
+/// Score: `scorer_similarity * diameter * (0.5 + 0.5 * tau.min(1.0))`.
+///
+/// Uses pre-computed scorer similarities from `scorer_context` instead of
+/// Chemistry. This eliminates the divergence between the user-visible ranking
+/// (from Scorer) and the enzyme evaluation (previously from Chemistry).
+///
+/// The tau factor provides a 50–100% scaling window: new agents (tau ≈ 0.001)
+/// still get half their capability score, while proven agents (tau → 1.0) get
+/// the full score. This prevents cold-start starvation while rewarding reliability.
 pub struct CapabilityKernel;
 
 impl ReasoningKernel for CapabilityKernel {
@@ -58,24 +86,18 @@ impl ReasoningKernel for CapabilityKernel {
         KernelType::CapabilityMatching
     }
 
-    fn evaluate(&self, signal: &Signal, hyphae: &[&Hypha]) -> KernelRecommendation {
-        let query_sig = match signal {
-            Signal::Tendril(t) => &t.query_signature,
-            _ => {
-                let mut ranked: Vec<(HyphaId, f64)> = hyphae
-                    .iter()
-                    .map(|h| (h.id.clone(), h.state.diameter))
-                    .collect();
-                ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                return KernelRecommendation { ranked };
-            }
-        };
-
+    fn evaluate(
+        &self,
+        _signal: &Signal,
+        hyphae: &[&Hypha],
+        scorer_context: &ScorerContext,
+    ) -> KernelRecommendation {
         let mut ranked: Vec<(HyphaId, f64)> = hyphae
             .iter()
             .map(|h| {
-                let similarity = h.chemistry.similarity(query_sig);
-                (h.id.clone(), similarity * h.state.diameter)
+                let similarity = scorer_context.get(&h.id).copied().unwrap_or(0.0);
+                let tau_factor = 0.5 + 0.5 * h.state.tau.min(1.0);
+                (h.id.clone(), similarity * h.state.diameter * tau_factor)
             })
             .collect();
         ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -91,7 +113,12 @@ impl ReasoningKernel for NoveltyKernel {
         KernelType::NoveltySeeking
     }
 
-    fn evaluate(&self, _signal: &Signal, hyphae: &[&Hypha]) -> KernelRecommendation {
+    fn evaluate(
+        &self,
+        _signal: &Signal,
+        hyphae: &[&Hypha],
+        _scorer_context: &ScorerContext,
+    ) -> KernelRecommendation {
         let mut ranked: Vec<(HyphaId, f64)> = hyphae
             .iter()
             .map(|h| {
@@ -112,7 +139,12 @@ impl ReasoningKernel for LoadBalancingKernel {
         KernelType::LoadBalancing
     }
 
-    fn evaluate(&self, _signal: &Signal, hyphae: &[&Hypha]) -> KernelRecommendation {
+    fn evaluate(
+        &self,
+        _signal: &Signal,
+        hyphae: &[&Hypha],
+        _scorer_context: &ScorerContext,
+    ) -> KernelRecommendation {
         let mut ranked: Vec<(HyphaId, f64)> = hyphae
             .iter()
             .map(|h| {
@@ -136,7 +168,12 @@ impl ReasoningKernel for TemporalRecencyKernel {
         KernelType::TemporalRecency
     }
 
-    fn evaluate(&self, _signal: &Signal, hyphae: &[&Hypha]) -> KernelRecommendation {
+    fn evaluate(
+        &self,
+        _signal: &Signal,
+        hyphae: &[&Hypha],
+        _scorer_context: &ScorerContext,
+    ) -> KernelRecommendation {
         use std::time::Instant;
         let now = Instant::now();
         let mut ranked: Vec<(HyphaId, f64)> = hyphae
@@ -234,7 +271,12 @@ impl SLNEnzyme {
     }
 
     /// Evaluate all kernels and produce a routing decision via majority vote.
-    fn evaluate_kernels(&self, signal: &Signal, hyphae: &[&Hypha]) -> EnzymeAction {
+    fn evaluate_kernels(
+        &self,
+        signal: &Signal,
+        hyphae: &[&Hypha],
+        scorer_context: &ScorerContext,
+    ) -> EnzymeAction {
         if hyphae.is_empty() {
             return EnzymeAction::Dissolve;
         }
@@ -242,7 +284,7 @@ impl SLNEnzyme {
         // Each kernel picks its top-1 hypha (argmax).
         let mut votes: BTreeMap<HyphaId, usize> = BTreeMap::new();
         for kernel in &self.kernels {
-            let rec = kernel.evaluate(signal, hyphae);
+            let rec = kernel.evaluate(signal, hyphae, scorer_context);
             if let Some((id, _)) = rec.ranked.first() {
                 *votes.entry(id.clone()).or_insert(0) += 1;
             }
@@ -302,7 +344,15 @@ impl SLNEnzyme {
     /// For each kernel, scores are normalized to [0,1] by dividing by the max.
     /// The composite score is the average across all kernels.
     /// `top_picks` tracks each kernel's top choice for confidence detection.
-    pub fn evaluate_with_scores(&self, signal: &Signal, hyphae: &[&Hypha]) -> KernelEvaluation {
+    ///
+    /// `scorer_context` provides pre-computed scorer similarities so the
+    /// CapabilityKernel uses the same values as the user-visible ranking.
+    pub fn evaluate_with_scores(
+        &self,
+        signal: &Signal,
+        hyphae: &[&Hypha],
+        scorer_context: &ScorerContext,
+    ) -> KernelEvaluation {
         if hyphae.is_empty() {
             return KernelEvaluation {
                 agent_scores: HashMap::new(),
@@ -315,7 +365,7 @@ impl SLNEnzyme {
         let mut top_picks: Vec<(KernelType, HyphaId)> = Vec::new();
 
         for kernel in &self.kernels {
-            let rec = kernel.evaluate(signal, hyphae);
+            let rec = kernel.evaluate(signal, hyphae, scorer_context);
 
             // Find max score for normalization.
             let max_score = rec.ranked.iter().map(|(_, s)| *s).fold(0.0_f64, f64::max);
@@ -362,11 +412,12 @@ impl Enzyme for SLNEnzyme {
         _spore: &Spore,
         hyphae: &[&Hypha],
         _membrane: &MembraneState,
+        scorer_context: &ScorerContext,
     ) -> EnzymeDecision {
         let decision_id = self.next_decision_id();
 
         let action = match signal {
-            Signal::Tendril(_) => self.evaluate_kernels(signal, hyphae),
+            Signal::Tendril(_) => self.evaluate_kernels(signal, hyphae, scorer_context),
             _ => EnzymeAction::Absorb,
         };
 
@@ -397,6 +448,17 @@ mod tests {
         forwards_count: u64,
         chemistry: Chemistry,
     ) -> Hypha {
+        make_hypha_with_tau(id_byte, diameter, sigma, forwards_count, chemistry, 0.01)
+    }
+
+    fn make_hypha_with_tau(
+        id_byte: u8,
+        diameter: f64,
+        sigma: f64,
+        forwards_count: u64,
+        chemistry: Chemistry,
+        tau: f64,
+    ) -> Hypha {
         let mut id = [0u8; 32];
         id[0] = id_byte;
         Hypha {
@@ -404,9 +466,8 @@ mod tests {
             peer: PeerAddr(format!("local://agent-{}", id_byte)),
             state: HyphaState {
                 diameter,
-                tau: 0.01,
+                tau,
                 sigma,
-                omega: 0.0,
                 consecutive_pulse_timeouts: 0,
                 forwards_count,
             },
@@ -421,6 +482,18 @@ mod tests {
             query_signature: query_sig,
             query_config: QueryConfig::default(),
         })
+    }
+
+    /// Build scorer context from (hypha, similarity) pairs.
+    fn make_scorer_context(entries: &[(&Hypha, f64)]) -> ScorerContext {
+        entries
+            .iter()
+            .map(|(h, sim)| (h.id.clone(), *sim))
+            .collect()
+    }
+
+    fn empty_scorer_context() -> ScorerContext {
+        ScorerContext::new()
     }
 
     fn make_membrane() -> MembraneState {
@@ -443,26 +516,21 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn capability_kernel_ranks_by_similarity_times_diameter() {
+    fn capability_kernel_ranks_by_scorer_similarity_times_diameter_times_tau() {
         let kernel = CapabilityKernel;
 
-        // Hypha A: chemistry matches query (all 0x42), diameter = 1.0
-        let mut chem_a = Chemistry::new();
-        chem_a.deposit(&[0x42; 64]);
-        let h_a = make_hypha(1, 1.0, 0.0, 0, chem_a);
+        // Hypha A: scorer says similarity = 1.0, diameter = 1.0, tau = 1.0
+        let h_a = make_hypha_with_tau(1, 1.0, 0.0, 0, Chemistry::new(), 1.0);
+        // Hypha B: scorer says similarity = 0.0, diameter = 1.0, tau = 1.0
+        let h_b = make_hypha_with_tau(2, 1.0, 0.0, 0, Chemistry::new(), 1.0);
 
-        // Hypha B: chemistry does NOT match query (all 0x00), diameter = 1.0
-        let mut chem_b = Chemistry::new();
-        chem_b.deposit(&[0x00; 64]);
-        let h_b = make_hypha(2, 1.0, 0.0, 0, chem_b);
-
-        let query = QuerySignature::new([0x42; 64]);
-        let signal = make_tendril_signal(query);
-
+        let signal = make_tendril_signal(QuerySignature::default());
         let hyphae: Vec<&Hypha> = vec![&h_b, &h_a]; // put B first to verify sorting
-        let rec = kernel.evaluate(&signal, &hyphae);
+        let ctx = make_scorer_context(&[(&h_a, 1.0), (&h_b, 0.0)]);
+        let rec = kernel.evaluate(&signal, &hyphae, &ctx);
 
-        // Hypha A should rank first (similarity=1.0*1.0=1.0 vs similarity=0.0*1.0=0.0)
+        // tau_factor = 0.5 + 0.5 * 1.0 = 1.0
+        // Hypha A: 1.0 * 1.0 * 1.0 = 1.0, Hypha B: 0.0 * 1.0 * 1.0 = 0.0
         assert_eq!(rec.ranked.len(), 2);
         assert_eq!(rec.ranked[0].0, h_a.id);
         assert!((rec.ranked[0].1 - 1.0).abs() < f64::EPSILON);
@@ -471,39 +539,67 @@ mod tests {
     }
 
     #[test]
-    fn capability_kernel_non_tendril_fallback() {
+    fn capability_kernel_tau_influences_score() {
         let kernel = CapabilityKernel;
 
-        let h_a = make_hypha(1, 2.0, 0.0, 0, Chemistry::new());
-        let h_b = make_hypha(2, 5.0, 0.0, 0, Chemistry::new());
+        // Both hyphae have same scorer similarity (1.0) and diameter, but different tau.
+        let h_reliable = make_hypha_with_tau(1, 1.0, 0.0, 0, Chemistry::new(), 0.8);
+        let h_new = make_hypha_with_tau(2, 1.0, 0.0, 0, Chemistry::new(), 0.01);
 
-        let signal = Signal::Nutrient;
-        let hyphae: Vec<&Hypha> = vec![&h_a, &h_b];
-        let rec = kernel.evaluate(&signal, &hyphae);
+        let signal = make_tendril_signal(QuerySignature::default());
+        let hyphae: Vec<&Hypha> = vec![&h_new, &h_reliable];
+        let ctx = make_scorer_context(&[(&h_reliable, 1.0), (&h_new, 1.0)]);
+        let rec = kernel.evaluate(&signal, &hyphae, &ctx);
 
-        // Should rank by diameter only — h_b (5.0) before h_a (2.0)
-        assert_eq!(rec.ranked.len(), 2);
-        assert_eq!(rec.ranked[0].0, h_b.id);
-        assert!((rec.ranked[0].1 - 5.0).abs() < f64::EPSILON);
-        assert_eq!(rec.ranked[1].0, h_a.id);
-        assert!((rec.ranked[1].1 - 2.0).abs() < f64::EPSILON);
+        // h_reliable (tau=0.8 → factor=0.9) should outscore h_new (tau=0.01 → factor=0.505)
+        assert_eq!(rec.ranked[0].0, h_reliable.id);
+        assert!(
+            rec.ranked[0].1 > rec.ranked[1].1,
+            "reliable ({:.3}) should outscore new ({:.3})",
+            rec.ranked[0].1,
+            rec.ranked[1].1
+        );
     }
 
     #[test]
-    fn capability_kernel_equal_similarity_tiebreak() {
+    fn capability_kernel_uses_scorer_not_chemistry() {
         let kernel = CapabilityKernel;
 
-        // Both have the same chemistry (default 0xFF) so same similarity.
-        let h_a = make_hypha(1, 3.0, 0.0, 0, Chemistry::new());
-        let h_b = make_hypha(2, 7.0, 0.0, 0, Chemistry::new());
+        // Hypha A: chemistry would give high similarity, but scorer says 0.0
+        let mut chem_a = Chemistry::new();
+        chem_a.deposit(&[0x42; 64]);
+        let h_a = make_hypha_with_tau(1, 1.0, 0.0, 0, chem_a, 1.0);
 
-        // Query = default 0xFF matches both perfectly (similarity=1.0).
-        let query = QuerySignature::default();
-        let signal = make_tendril_signal(query);
+        // Hypha B: chemistry would give 0.0, but scorer says 1.0
+        let h_b = make_hypha_with_tau(2, 1.0, 0.0, 0, Chemistry::new(), 1.0);
+
+        let signal = make_tendril_signal(QuerySignature::new([0x42; 64]));
         let hyphae: Vec<&Hypha> = vec![&h_a, &h_b];
-        let rec = kernel.evaluate(&signal, &hyphae);
+        // Scorer says B is better — opposite of what Chemistry would say
+        let ctx = make_scorer_context(&[(&h_a, 0.0), (&h_b, 1.0)]);
+        let rec = kernel.evaluate(&signal, &hyphae, &ctx);
 
-        // h_b should rank first: score = 1.0 * 7.0 vs 1.0 * 3.0
+        // B should rank first (scorer says 1.0), proving scorer overrides chemistry
+        assert_eq!(rec.ranked[0].0, h_b.id);
+        assert!((rec.ranked[0].1 - 1.0).abs() < f64::EPSILON);
+        assert_eq!(rec.ranked[1].0, h_a.id);
+        assert!(rec.ranked[1].1.abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn capability_kernel_diameter_tiebreak() {
+        let kernel = CapabilityKernel;
+
+        // Both have same scorer similarity (1.0) but different diameters.
+        let h_a = make_hypha_with_tau(1, 3.0, 0.0, 0, Chemistry::new(), 1.0);
+        let h_b = make_hypha_with_tau(2, 7.0, 0.0, 0, Chemistry::new(), 1.0);
+
+        let signal = make_tendril_signal(QuerySignature::default());
+        let hyphae: Vec<&Hypha> = vec![&h_a, &h_b];
+        let ctx = make_scorer_context(&[(&h_a, 1.0), (&h_b, 1.0)]);
+        let rec = kernel.evaluate(&signal, &hyphae, &ctx);
+
+        // h_b should rank first: 1.0 * 7.0 * 1.0 > 1.0 * 3.0 * 1.0
         assert_eq!(rec.ranked[0].0, h_b.id);
         assert_eq!(rec.ranked[1].0, h_a.id);
     }
@@ -513,7 +609,7 @@ mod tests {
         let kernel = CapabilityKernel;
         let signal = make_tendril_signal(QuerySignature::default());
         let hyphae: Vec<&Hypha> = vec![];
-        let rec = kernel.evaluate(&signal, &hyphae);
+        let rec = kernel.evaluate(&signal, &hyphae, &empty_scorer_context());
         assert!(rec.ranked.is_empty());
     }
 
@@ -525,14 +621,12 @@ mod tests {
     fn novelty_kernel_favors_low_sigma() {
         let kernel = NoveltyKernel;
 
-        // Hypha A: sigma = 0.0 → novelty = 1/(1+0) = 1.0
         let h_a = make_hypha(1, 1.0, 0.0, 0, Chemistry::new());
-        // Hypha B: sigma = 9.0 → novelty = 1/(1+9) = 0.1
         let h_b = make_hypha(2, 1.0, 9.0, 0, Chemistry::new());
 
         let signal = make_tendril_signal(QuerySignature::default());
         let hyphae: Vec<&Hypha> = vec![&h_b, &h_a];
-        let rec = kernel.evaluate(&signal, &hyphae);
+        let rec = kernel.evaluate(&signal, &hyphae, &empty_scorer_context());
 
         assert_eq!(rec.ranked[0].0, h_a.id);
         assert!((rec.ranked[0].1 - 1.0).abs() < f64::EPSILON);
@@ -543,15 +637,13 @@ mod tests {
     fn novelty_kernel_ignores_diameter() {
         let kernel = NoveltyKernel;
 
-        // Same sigma, different diameters — NoveltyKernel should score identically.
-        let h_a = make_hypha(1, 2.0, 1.0, 0, Chemistry::new()); // novelty = 1/(1+1) = 0.5
-        let h_b = make_hypha(2, 6.0, 1.0, 0, Chemistry::new()); // novelty = 1/(1+1) = 0.5
+        let h_a = make_hypha(1, 2.0, 1.0, 0, Chemistry::new());
+        let h_b = make_hypha(2, 6.0, 1.0, 0, Chemistry::new());
 
         let signal = make_tendril_signal(QuerySignature::default());
         let hyphae: Vec<&Hypha> = vec![&h_a, &h_b];
-        let rec = kernel.evaluate(&signal, &hyphae);
+        let rec = kernel.evaluate(&signal, &hyphae, &empty_scorer_context());
 
-        // Both should have the same score (0.5) since diameter is not used.
         assert!((rec.ranked[0].1 - 0.5).abs() < f64::EPSILON);
         assert!((rec.ranked[1].1 - 0.5).abs() < f64::EPSILON);
     }
@@ -561,7 +653,7 @@ mod tests {
         let kernel = NoveltyKernel;
         let signal = make_tendril_signal(QuerySignature::default());
         let hyphae: Vec<&Hypha> = vec![];
-        let rec = kernel.evaluate(&signal, &hyphae);
+        let rec = kernel.evaluate(&signal, &hyphae, &empty_scorer_context());
         assert!(rec.ranked.is_empty());
     }
 
@@ -573,14 +665,12 @@ mod tests {
     fn load_balancing_kernel_favors_fewer_forwards() {
         let kernel = LoadBalancingKernel;
 
-        // Hypha A: forwards=0 → score = 1.0/(1+0)=1.0
         let h_a = make_hypha(1, 1.0, 0.0, 0, Chemistry::new());
-        // Hypha B: forwards=99 → score = 1.0/(1+99)=0.01
         let h_b = make_hypha(2, 1.0, 0.0, 99, Chemistry::new());
 
         let signal = make_tendril_signal(QuerySignature::default());
         let hyphae: Vec<&Hypha> = vec![&h_b, &h_a];
-        let rec = kernel.evaluate(&signal, &hyphae);
+        let rec = kernel.evaluate(&signal, &hyphae, &empty_scorer_context());
 
         assert_eq!(rec.ranked[0].0, h_a.id);
         assert!((rec.ranked[0].1 - 1.0).abs() < f64::EPSILON);
@@ -590,13 +680,12 @@ mod tests {
     fn load_balancing_kernel_scales_by_diameter() {
         let kernel = LoadBalancingKernel;
 
-        // Same forwards_count, different diameters.
-        let h_a = make_hypha(1, 2.0, 0.0, 5, Chemistry::new()); // score = 2.0/(1+5) = 0.333..
-        let h_b = make_hypha(2, 12.0, 0.0, 5, Chemistry::new()); // score = 12.0/(1+5) = 2.0
+        let h_a = make_hypha(1, 2.0, 0.0, 5, Chemistry::new());
+        let h_b = make_hypha(2, 12.0, 0.0, 5, Chemistry::new());
 
         let signal = make_tendril_signal(QuerySignature::default());
         let hyphae: Vec<&Hypha> = vec![&h_a, &h_b];
-        let rec = kernel.evaluate(&signal, &hyphae);
+        let rec = kernel.evaluate(&signal, &hyphae, &empty_scorer_context());
 
         assert_eq!(rec.ranked[0].0, h_b.id);
         assert!((rec.ranked[0].1 - 2.0).abs() < f64::EPSILON);
@@ -607,7 +696,7 @@ mod tests {
         let kernel = LoadBalancingKernel;
         let signal = make_tendril_signal(QuerySignature::default());
         let hyphae: Vec<&Hypha> = vec![];
-        let rec = kernel.evaluate(&signal, &hyphae);
+        let rec = kernel.evaluate(&signal, &hyphae, &empty_scorer_context());
         assert!(rec.ranked.is_empty());
     }
 
@@ -623,34 +712,28 @@ mod tests {
         let membrane = make_membrane();
         let hyphae: Vec<&Hypha> = vec![];
 
-        let decision = enzyme.process(&signal, &spore, &hyphae, &membrane);
+        let decision = enzyme.process(&signal, &spore, &hyphae, &membrane, &empty_scorer_context());
         assert_eq!(decision.action, EnzymeAction::Dissolve);
     }
 
     #[test]
     fn sln_enzyme_unanimous_vote_forward() {
         // Create one hypha that is clearly the best by ALL kernel criteria:
-        //   - Best chemistry match (CapabilityKernel)
+        //   - Best scorer similarity (CapabilityKernel)
         //   - Lowest sigma (NoveltyKernel)
         //   - Fewest forwards (LoadBalancingKernel)
         //   - Most recent activity (TemporalRecencyKernel — both created now, so tied)
-        let mut chem_good = Chemistry::new();
-        chem_good.deposit(&[0x42; 64]);
-        let h_good = make_hypha(1, 5.0, 0.0, 0, chem_good);
+        let h_good = make_hypha(1, 5.0, 0.0, 0, Chemistry::new());
+        let h_bad = make_hypha(2, 1.0, 100.0, 1000, Chemistry::new());
 
-        // A clearly worse hypha on all axes.
-        let mut chem_bad = Chemistry::new();
-        chem_bad.deposit(&[0x00; 64]);
-        let h_bad = make_hypha(2, 1.0, 100.0, 1000, chem_bad);
-
-        let query = QuerySignature::new([0x42; 64]);
-        let signal = make_tendril_signal(query);
+        let signal = make_tendril_signal(QuerySignature::default());
         let spore = Spore::new(SporeConfig::default());
         let membrane = make_membrane();
         let hyphae: Vec<&Hypha> = vec![&h_good, &h_bad];
+        let ctx = make_scorer_context(&[(&h_good, 1.0), (&h_bad, 0.0)]);
 
         let mut enzyme = SLNEnzyme::with_discovery_kernels(SLNEnzymeConfig::default());
-        let decision = enzyme.process(&signal, &spore, &hyphae, &membrane);
+        let decision = enzyme.process(&signal, &spore, &hyphae, &membrane, &ctx);
 
         assert_eq!(
             decision.action,
@@ -663,43 +746,31 @@ mod tests {
     #[test]
     fn sln_enzyme_disagreement_split_with_unanimous_quorum() {
         // With Unanimous quorum, even partial agreement causes a Split.
-        // 4 kernels, 3 hyphae — at most 2 kernels can agree → not unanimous → Split.
-        //
-        // CapabilityKernel picks by: similarity * diameter
-        // NoveltyKernel picks by:    1/(1+sigma)  (diameter-independent)
+        // CapabilityKernel picks by: scorer_similarity * diameter * tau_factor
+        // NoveltyKernel picks by:    1/(1+sigma)
         // LoadBalancingKernel picks by: diameter / (1+forwards_count)
         // TemporalRecencyKernel picks by: recency(last_activity)
         //
-        // Hypha A: best chemistry match, but high sigma and high forwards
-        let mut chem_a = Chemistry::new();
-        chem_a.deposit(&[0x42; 64]);
-        let h_a = make_hypha(1, 2.0, 1000.0, 1000, chem_a);
+        // Hypha A: best scorer similarity, but high sigma and high forwards
+        let h_a = make_hypha(1, 2.0, 1000.0, 1000, Chemistry::new());
+        // Hypha B: no scorer similarity, but lowest sigma, high forwards
+        let h_b = make_hypha(2, 2.0, 0.0, 1000, Chemistry::new());
+        // Hypha C: no scorer similarity, high sigma, but fewest forwards
+        let h_c = make_hypha(3, 2.0, 1000.0, 0, Chemistry::new());
 
-        // Hypha B: poor chemistry match, but lowest sigma, high forwards
-        let mut chem_b = Chemistry::new();
-        chem_b.deposit(&[0x00; 64]);
-        let h_b = make_hypha(2, 2.0, 0.0, 1000, chem_b);
-
-        // Hypha C: poor chemistry match, high sigma, but fewest forwards
-        let mut chem_c = Chemistry::new();
-        chem_c.deposit(&[0x00; 64]);
-        let h_c = make_hypha(3, 2.0, 1000.0, 0, chem_c);
-
-        let query = QuerySignature::new([0x42; 64]);
-        let signal = make_tendril_signal(query);
+        let signal = make_tendril_signal(QuerySignature::default());
         let spore = Spore::new(SporeConfig::default());
         let membrane = make_membrane();
         let hyphae: Vec<&Hypha> = vec![&h_a, &h_b, &h_c];
+        let ctx = make_scorer_context(&[(&h_a, 1.0), (&h_b, 0.0), (&h_c, 0.0)]);
 
         let config = SLNEnzymeConfig {
             quorum: Quorum::Unanimous,
             ..SLNEnzymeConfig::default()
         };
         let mut enzyme = SLNEnzyme::with_discovery_kernels(config);
-        let decision = enzyme.process(&signal, &spore, &hyphae, &membrane);
+        let decision = enzyme.process(&signal, &spore, &hyphae, &membrane, &ctx);
 
-        // With Unanimous quorum, even 3/4 agreement triggers Split.
-        // max_disagreement_split = 3, so targets.len() <= 3
         match &decision.action {
             EnzymeAction::Split { targets } => {
                 assert!(
@@ -718,25 +789,18 @@ mod tests {
 
     #[test]
     fn sln_enzyme_majority_quorum_forwards_with_agreement() {
-        // With 4 kernels and Majority quorum, 3/4 agreement → Forward.
-        // Create a scenario where one hypha is best on most axes.
-        let mut chem_good = Chemistry::new();
-        chem_good.deposit(&[0x42; 64]);
-        // h_good: best chemistry, low sigma, low forwards → 3 kernels agree
-        let h_good = make_hypha(1, 5.0, 0.0, 0, chem_good);
+        // h_good: best scorer similarity, low sigma, low forwards → 3+ kernels agree
+        let h_good = make_hypha(1, 5.0, 0.0, 0, Chemistry::new());
+        let h_bad = make_hypha(2, 1.0, 100.0, 1000, Chemistry::new());
 
-        let mut chem_bad = Chemistry::new();
-        chem_bad.deposit(&[0x00; 64]);
-        let h_bad = make_hypha(2, 1.0, 100.0, 1000, chem_bad);
-
-        let query = QuerySignature::new([0x42; 64]);
-        let signal = make_tendril_signal(query);
+        let signal = make_tendril_signal(QuerySignature::default());
         let spore = Spore::new(SporeConfig::default());
         let membrane = make_membrane();
         let hyphae: Vec<&Hypha> = vec![&h_good, &h_bad];
+        let ctx = make_scorer_context(&[(&h_good, 1.0), (&h_bad, 0.0)]);
 
         let mut enzyme = SLNEnzyme::with_discovery_kernels(SLNEnzymeConfig::default());
-        let decision = enzyme.process(&signal, &spore, &hyphae, &membrane);
+        let decision = enzyme.process(&signal, &spore, &hyphae, &membrane, &ctx);
 
         assert_eq!(
             decision.action,
@@ -756,7 +820,7 @@ mod tests {
         let h = make_hypha(1, 1.0, 0.0, 0, Chemistry::new());
         let hyphae: Vec<&Hypha> = vec![&h];
 
-        let decision = enzyme.process(&signal, &spore, &hyphae, &membrane);
+        let decision = enzyme.process(&signal, &spore, &hyphae, &membrane, &empty_scorer_context());
         assert_eq!(decision.action, EnzymeAction::Absorb);
     }
 
@@ -768,21 +832,15 @@ mod tests {
     fn evaluate_with_scores_returns_normalized() {
         let enzyme = SLNEnzyme::with_discovery_kernels(SLNEnzymeConfig::default());
 
-        let mut chem_a = Chemistry::new();
-        chem_a.deposit(&[0x42; 64]);
-        let h_a = make_hypha(1, 5.0, 0.0, 0, chem_a);
+        let h_a = make_hypha(1, 5.0, 0.0, 0, Chemistry::new());
+        let h_b = make_hypha(2, 1.0, 10.0, 50, Chemistry::new());
 
-        let mut chem_b = Chemistry::new();
-        chem_b.deposit(&[0x00; 64]);
-        let h_b = make_hypha(2, 1.0, 10.0, 50, chem_b);
-
-        let query = QuerySignature::new([0x42; 64]);
-        let signal = make_tendril_signal(query);
+        let signal = make_tendril_signal(QuerySignature::default());
         let hyphae: Vec<&Hypha> = vec![&h_a, &h_b];
+        let ctx = make_scorer_context(&[(&h_a, 0.9), (&h_b, 0.1)]);
 
-        let eval = enzyme.evaluate_with_scores(&signal, &hyphae);
+        let eval = enzyme.evaluate_with_scores(&signal, &hyphae, &ctx);
 
-        // All agent scores should be in [0, 1].
         for score in eval.agent_scores.values() {
             assert!(
                 *score >= 0.0 && *score <= 1.0,
@@ -791,7 +849,6 @@ mod tests {
             );
         }
 
-        // Should have top picks for each kernel (4 kernels).
         assert_eq!(eval.top_picks.len(), 4);
     }
 
@@ -800,26 +857,18 @@ mod tests {
         let enzyme = SLNEnzyme::with_discovery_kernels(SLNEnzymeConfig::default());
 
         // Create h_bad FIRST so h_good is more recent (TemporalRecencyKernel).
-        let mut chem_bad = Chemistry::new();
-        chem_bad.deposit(&[0x00; 64]);
-        let h_bad = make_hypha(2, 1.0, 100.0, 1000, chem_bad);
+        let h_bad = make_hypha(2, 1.0, 100.0, 1000, Chemistry::new());
+        let h_good = make_hypha(1, 5.0, 0.0, 0, Chemistry::new());
 
-        // One clearly dominant hypha: best similarity, lowest sigma, fewest forwards, most recent.
-        let mut chem_good = Chemistry::new();
-        chem_good.deposit(&[0x42; 64]);
-        let h_good = make_hypha(1, 5.0, 0.0, 0, chem_good);
-
-        let query = QuerySignature::new([0x42; 64]);
-        let signal = make_tendril_signal(query);
+        let signal = make_tendril_signal(QuerySignature::default());
         let hyphae: Vec<&Hypha> = vec![&h_good, &h_bad];
+        let ctx = make_scorer_context(&[(&h_good, 1.0), (&h_bad, 0.0)]);
 
-        let eval = enzyme.evaluate_with_scores(&signal, &hyphae);
+        let eval = enzyme.evaluate_with_scores(&signal, &hyphae, &ctx);
 
-        // All 3 kernels should pick the same agent.
         let all_same = eval.top_picks.iter().all(|(_, id)| *id == h_good.id);
         assert!(all_same, "all kernels should pick h_good unanimously");
 
-        // h_good should have a higher composite score.
         let good_score = eval.agent_scores.get(&h_good.id).copied().unwrap_or(0.0);
         let bad_score = eval.agent_scores.get(&h_bad.id).copied().unwrap_or(0.0);
         assert!(
@@ -834,26 +883,17 @@ mod tests {
     fn evaluate_with_scores_split_detection() {
         let enzyme = SLNEnzyme::with_discovery_kernels(SLNEnzymeConfig::default());
 
-        // Same setup as sln_enzyme_disagreement_split — each kernel picks different winner.
-        let mut chem_a = Chemistry::new();
-        chem_a.deposit(&[0x42; 64]);
-        let h_a = make_hypha(1, 2.0, 1000.0, 1000, chem_a);
+        // Each kernel picks a different winner.
+        let h_a = make_hypha(1, 2.0, 1000.0, 1000, Chemistry::new());
+        let h_b = make_hypha(2, 2.0, 0.0, 1000, Chemistry::new());
+        let h_c = make_hypha(3, 2.0, 1000.0, 0, Chemistry::new());
 
-        let mut chem_b = Chemistry::new();
-        chem_b.deposit(&[0x00; 64]);
-        let h_b = make_hypha(2, 2.0, 0.0, 1000, chem_b);
-
-        let mut chem_c = Chemistry::new();
-        chem_c.deposit(&[0x00; 64]);
-        let h_c = make_hypha(3, 2.0, 1000.0, 0, chem_c);
-
-        let query = QuerySignature::new([0x42; 64]);
-        let signal = make_tendril_signal(query);
+        let signal = make_tendril_signal(QuerySignature::default());
         let hyphae: Vec<&Hypha> = vec![&h_a, &h_b, &h_c];
+        let ctx = make_scorer_context(&[(&h_a, 1.0), (&h_b, 0.0), (&h_c, 0.0)]);
 
-        let eval = enzyme.evaluate_with_scores(&signal, &hyphae);
+        let eval = enzyme.evaluate_with_scores(&signal, &hyphae, &ctx);
 
-        // Top picks should have at least 2 distinct agents (disagreement).
         let distinct_ids: std::collections::HashSet<&HyphaId> =
             eval.top_picks.iter().map(|(_, id)| id).collect();
         assert!(
@@ -869,7 +909,7 @@ mod tests {
         let signal = make_tendril_signal(QuerySignature::default());
         let hyphae: Vec<&Hypha> = vec![];
 
-        let eval = enzyme.evaluate_with_scores(&signal, &hyphae);
+        let eval = enzyme.evaluate_with_scores(&signal, &hyphae, &empty_scorer_context());
         assert!(eval.agent_scores.is_empty());
         assert!(eval.top_picks.is_empty());
     }
@@ -882,17 +922,14 @@ mod tests {
     fn temporal_recency_kernel_favors_recent() {
         let kernel = TemporalRecencyKernel;
 
-        // All hyphae created with Instant::now() — last one is most recent.
         let h_old = make_hypha(1, 1.0, 0.0, 0, Chemistry::new());
-        // Sleep briefly to create temporal separation.
         std::thread::sleep(std::time::Duration::from_millis(10));
         let h_new = make_hypha(2, 1.0, 0.0, 0, Chemistry::new());
 
         let signal = make_tendril_signal(QuerySignature::default());
         let hyphae: Vec<&Hypha> = vec![&h_old, &h_new];
-        let rec = kernel.evaluate(&signal, &hyphae);
+        let rec = kernel.evaluate(&signal, &hyphae, &empty_scorer_context());
 
-        // h_new should rank first (more recent activity).
         assert_eq!(rec.ranked[0].0, h_new.id);
         assert!(
             rec.ranked[0].1 > rec.ranked[1].1,
@@ -906,15 +943,13 @@ mod tests {
     fn temporal_recency_kernel_ignores_diameter() {
         let kernel = TemporalRecencyKernel;
 
-        // Same creation time (approximately), different diameters.
         let h_a = make_hypha(1, 10.0, 0.0, 0, Chemistry::new());
         let h_b = make_hypha(2, 0.1, 0.0, 0, Chemistry::new());
 
         let signal = make_tendril_signal(QuerySignature::default());
         let hyphae: Vec<&Hypha> = vec![&h_a, &h_b];
-        let rec = kernel.evaluate(&signal, &hyphae);
+        let rec = kernel.evaluate(&signal, &hyphae, &empty_scorer_context());
 
-        // Scores should be approximately equal (both created now).
         let diff = (rec.ranked[0].1 - rec.ranked[1].1).abs();
         assert!(
             diff < 0.01,
@@ -928,7 +963,7 @@ mod tests {
         let kernel = TemporalRecencyKernel;
         let signal = make_tendril_signal(QuerySignature::default());
         let hyphae: Vec<&Hypha> = vec![];
-        let rec = kernel.evaluate(&signal, &hyphae);
+        let rec = kernel.evaluate(&signal, &hyphae, &empty_scorer_context());
         assert!(rec.ranked.is_empty());
     }
 
@@ -940,19 +975,14 @@ mod tests {
     fn unanimous_quorum_produces_more_splits() {
         // Same setup, run with Majority vs Unanimous quorum.
         // Unanimous should produce more Splits.
-        let mut chem = Chemistry::new();
-        chem.deposit(&[0x42; 64]);
-        let h_a = make_hypha(1, 5.0, 0.0, 0, chem);
+        let h_a = make_hypha(1, 5.0, 0.0, 0, Chemistry::new());
+        let h_b = make_hypha(2, 1.0, 5.0, 50, Chemistry::new());
 
-        let mut chem_b = Chemistry::new();
-        chem_b.deposit(&[0x00; 64]);
-        let h_b = make_hypha(2, 1.0, 5.0, 50, chem_b);
-
-        let query = QuerySignature::new([0x42; 64]);
-        let signal = make_tendril_signal(query);
+        let signal = make_tendril_signal(QuerySignature::default());
         let spore = Spore::new(SporeConfig::default());
         let membrane = make_membrane();
         let hyphae: Vec<&Hypha> = vec![&h_a, &h_b];
+        let ctx = make_scorer_context(&[(&h_a, 1.0), (&h_b, 0.1)]);
 
         // With Majority quorum — likely Forward (3-4 kernels agree on h_a).
         let config_majority = SLNEnzymeConfig {
@@ -960,7 +990,7 @@ mod tests {
             ..SLNEnzymeConfig::default()
         };
         let mut enzyme_majority = SLNEnzyme::with_discovery_kernels(config_majority);
-        let dec_majority = enzyme_majority.process(&signal, &spore, &hyphae, &membrane);
+        let dec_majority = enzyme_majority.process(&signal, &spore, &hyphae, &membrane, &ctx);
         let majority_forwards = matches!(dec_majority.action, EnzymeAction::Forward { .. });
 
         // With Unanimous quorum — might Split if any kernel disagrees.
@@ -969,12 +999,9 @@ mod tests {
             ..SLNEnzymeConfig::default()
         };
         let mut enzyme_unanimous = SLNEnzyme::with_discovery_kernels(config_unanimous);
-        let dec_unanimous = enzyme_unanimous.process(&signal, &spore, &hyphae, &membrane);
+        let dec_unanimous = enzyme_unanimous.process(&signal, &spore, &hyphae, &membrane, &ctx);
         let unanimous_forwards = matches!(dec_unanimous.action, EnzymeAction::Forward { .. });
 
-        // Unanimous should be at least as strict as Majority.
-        // If Majority forwards, Unanimous might forward or split.
-        // If Majority splits, Unanimous MUST also split.
         if !majority_forwards {
             assert!(
                 !unanimous_forwards,
@@ -992,9 +1019,9 @@ mod tests {
 
         let signal = make_tendril_signal(QuerySignature::default());
         let hyphae: Vec<&Hypha> = vec![&h_a, &h_b];
-        let eval = enzyme.evaluate_with_scores(&signal, &hyphae);
+        let ctx = make_scorer_context(&[(&h_a, 0.5), (&h_b, 0.5)]);
+        let eval = enzyme.evaluate_with_scores(&signal, &hyphae, &ctx);
 
-        // 4 kernels → 4 top picks.
         assert_eq!(
             eval.top_picks.len(),
             4,
