@@ -2,13 +2,13 @@
 //
 // Save/load network state as JSON snapshots with versioned schema.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use serde_big_array::BigArray;
 use thiserror::Error;
 
-use super::registry::{AgentRecord, FeedbackRecord, MAX_FEEDBACK_RECORDS, TAU_FLOOR};
+use super::registry::{AgentRecord, FeedbackIndex, FeedbackRecord, TAU_FLOOR};
 
 /// Structured error type for network persistence operations.
 #[derive(Debug, Error)]
@@ -74,7 +74,7 @@ pub(crate) struct AgentLoadData {
     pub sigma: f64,
     pub forwards_count: u64,
     pub consecutive_pulse_timeouts: u8,
-    pub feedback: VecDeque<FeedbackRecord>,
+    pub feedback: FeedbackIndex,
 }
 
 /// Save agents to a JSON file.
@@ -89,6 +89,7 @@ pub(crate) fn save_snapshot(
             .map(|(name, record)| {
                 let feedback: Vec<FeedbackSnapshot> = record
                     .feedback
+                    .records()
                     .iter()
                     .map(|fb| FeedbackSnapshot {
                         query_minhash: fb.query_minhash,
@@ -104,7 +105,7 @@ pub(crate) fn save_snapshot(
                     tau: record.hypha.state.tau,
                     sigma: record.hypha.state.sigma,
                     omega: 0.0,
-                    forwards_count: record.hypha.state.forwards_count,
+                    forwards_count: record.hypha.state.forwards_count.get(),
                     consecutive_pulse_timeouts: record.hypha.state.consecutive_pulse_timeouts,
                     feedback,
                 }
@@ -132,13 +133,12 @@ pub(crate) fn load_snapshot(path: &str) -> Result<Vec<AgentLoadData>, NetworkErr
         .agents
         .into_iter()
         .map(|agent| {
-            let feedback_iter = agent.feedback.into_iter().map(|fb| FeedbackRecord {
-                query_minhash: fb.query_minhash,
-                outcome: fb.outcome,
-            });
-            let mut feedback: VecDeque<FeedbackRecord> = feedback_iter.collect();
-            while feedback.len() > MAX_FEEDBACK_RECORDS {
-                feedback.pop_front();
+            let mut feedback = FeedbackIndex::new();
+            for fb in agent.feedback {
+                feedback.insert(FeedbackRecord {
+                    query_minhash: fb.query_minhash,
+                    outcome: fb.outcome,
+                });
             }
             AgentLoadData {
                 name: agent.name,

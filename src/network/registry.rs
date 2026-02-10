@@ -30,6 +30,102 @@ pub struct FeedbackRecord {
     pub outcome: f64,
 }
 
+/// Banded LSH index for fast near-neighbor feedback lookup.
+///
+/// Partitions 64-byte MinHash signatures into `NUM_BANDS` bands of `BAND_WIDTH`
+/// bytes each. Each band is hashed into a bucket; candidate feedback records
+/// are those sharing at least one band hash with the query.
+///
+/// This reduces per-query feedback scan from O(n) to O(k) near-neighbors
+/// for large feedback histories.
+pub struct FeedbackIndex {
+    /// Band buckets: band_index → (band_hash → list of feedback indices).
+    bands: Vec<HashMap<u64, Vec<usize>>>,
+    /// All feedback records (append-only).
+    records: VecDeque<FeedbackRecord>,
+}
+
+const NUM_BANDS: usize = 16;
+const BAND_WIDTH: usize = 4; // 16 bands × 4 bytes = 64 bytes
+
+impl FeedbackIndex {
+    pub fn new() -> Self {
+        Self {
+            bands: (0..NUM_BANDS).map(|_| HashMap::new()).collect(),
+            records: VecDeque::new(),
+        }
+    }
+
+    /// Compute the band hash for a given band index.
+    fn band_hash(sig: &[u8; 64], band: usize) -> u64 {
+        let start = band * BAND_WIDTH;
+        let end = start + BAND_WIDTH;
+        xxhash_rust::xxh3::xxh3_64_with_seed(&sig[start..end], band as u64)
+    }
+
+    /// Insert a feedback record into the index.
+    pub fn insert(&mut self, record: FeedbackRecord) {
+        let idx = self.records.len();
+        for band in 0..NUM_BANDS {
+            let hash = Self::band_hash(&record.query_minhash, band);
+            self.bands[band].entry(hash).or_default().push(idx);
+        }
+        self.records.push_back(record);
+
+        // Evict oldest if over capacity.
+        if self.records.len() > MAX_FEEDBACK_RECORDS {
+            self.records.pop_front();
+            // Rebuild index after eviction (infrequent).
+            self.rebuild();
+        }
+    }
+
+    /// Rebuild band index from current records.
+    fn rebuild(&mut self) {
+        for band_map in &mut self.bands {
+            band_map.clear();
+        }
+        for (idx, record) in self.records.iter().enumerate() {
+            for band in 0..NUM_BANDS {
+                let hash = Self::band_hash(&record.query_minhash, band);
+                self.bands[band].entry(hash).or_default().push(idx);
+            }
+        }
+    }
+
+    /// Find candidate feedback records similar to the query signature.
+    ///
+    /// Returns an iterator over records sharing at least one band hash
+    /// with the query (near-neighbors in LSH space).
+    pub fn find_candidates(&self, query_minhash: &[u8; 64]) -> Vec<&FeedbackRecord> {
+        let mut seen = std::collections::HashSet::new();
+        let mut candidates = Vec::new();
+
+        for band in 0..NUM_BANDS {
+            let hash = Self::band_hash(query_minhash, band);
+            if let Some(indices) = self.bands[band].get(&hash) {
+                for &idx in indices {
+                    if idx < self.records.len() && seen.insert(idx) {
+                        candidates.push(&self.records[idx]);
+                    }
+                }
+            }
+        }
+
+        candidates
+    }
+
+    /// Returns the underlying records for persistence/backward compat.
+    pub fn records(&self) -> &VecDeque<FeedbackRecord> {
+        &self.records
+    }
+
+    /// Returns true if empty.
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+}
+
 /// Per-agent record stored in the network.
 pub struct AgentRecord {
     /// Capability descriptions retained for introspection and explain mode.
@@ -37,8 +133,8 @@ pub struct AgentRecord {
     pub endpoint: Option<String>,
     pub metadata: HashMap<String, String>,
     pub hypha: Hypha,
-    /// Per-query-type feedback history (most recent last).
-    pub feedback: VecDeque<FeedbackRecord>,
+    /// Per-query-type feedback history with banded LSH index for O(k) lookup.
+    pub feedback: FeedbackIndex,
 }
 
 /// Deterministically convert an agent name to a HyphaId.
@@ -81,7 +177,7 @@ pub fn register_agent(
             tau: 0.01,
             sigma: 0.0,
             consecutive_pulse_timeouts: 0,
-            forwards_count: 0,
+            forwards_count: crate::core::pheromone::AtomicCounter::new(0),
         },
         chemistry,
         last_activity: Instant::now(),
@@ -94,7 +190,7 @@ pub fn register_agent(
             endpoint: endpoint.map(|s| s.to_string()),
             metadata,
             hypha,
-            feedback: VecDeque::new(),
+            feedback: FeedbackIndex::new(),
         },
     );
 }
@@ -117,13 +213,10 @@ pub fn record_success(
         // Per-query-type feedback (if query provided).
         if let Some(q) = query {
             let query_sig = compute_query_signature(q.as_bytes(), lsh_config);
-            record.feedback.push_back(FeedbackRecord {
+            record.feedback.insert(FeedbackRecord {
                 query_minhash: query_sig.minhash,
                 outcome: 1.0,
             });
-            if record.feedback.len() > MAX_FEEDBACK_RECORDS {
-                record.feedback.pop_front();
-            }
         }
     }
 }
@@ -147,13 +240,10 @@ pub fn record_failure(
         // Per-query-type feedback (if query provided).
         if let Some(q) = query {
             let query_sig = compute_query_signature(q.as_bytes(), lsh_config);
-            record.feedback.push_back(FeedbackRecord {
+            record.feedback.insert(FeedbackRecord {
                 query_minhash: query_sig.minhash,
                 outcome: -1.0,
             });
-            if record.feedback.len() > MAX_FEEDBACK_RECORDS {
-                record.feedback.pop_front();
-            }
         }
     }
 }

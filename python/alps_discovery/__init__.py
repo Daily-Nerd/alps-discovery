@@ -19,6 +19,7 @@ try:
         ExplainedResult,
         LocalNetwork,
         Query,
+        TfIdfScorer,
     )
 except ImportError as e:
     raise ImportError(
@@ -82,5 +83,6 @@ __all__ = [
     "ExplainedResult",
     "LocalNetwork",
     "Query",
+    "TfIdfScorer",
     "capabilities_from_mcp",
 ]

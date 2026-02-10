@@ -8,12 +8,13 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::core::action::{EnzymeAction, EnzymeDecision};
 use crate::core::hyphae::Hypha;
-use crate::core::membrane::MembraneState;
 use crate::core::signal::Signal;
-use crate::core::spore::tree::Spore;
 use crate::core::types::{DecisionId, HyphaId, KernelType};
 
 /// The core enzyme trait — sans-IO routing decision interface.
+///
+/// OSS-simplified: no `&Spore` or `&MembraneState` parameters.
+/// These are proprietary protocol constructs not used in local discovery.
 pub trait Enzyme {
     /// Process a signal and return a routing decision.
     ///
@@ -21,9 +22,7 @@ pub trait Enzyme {
     fn process(
         &mut self,
         signal: &Signal,
-        spore: &Spore,
         hyphae: &[&Hypha],
-        membrane: &MembraneState,
         scorer_context: &ScorerContext,
     ) -> EnzymeDecision;
 }
@@ -148,7 +147,7 @@ impl ReasoningKernel for LoadBalancingKernel {
         let mut ranked: Vec<(HyphaId, f64)> = hyphae
             .iter()
             .map(|h| {
-                let score = h.state.diameter / (1.0 + h.state.forwards_count as f64);
+                let score = h.state.diameter / (1.0 + h.state.forwards_count.get() as f64);
                 (h.id.clone(), score)
             })
             .collect();
@@ -409,9 +408,7 @@ impl Enzyme for SLNEnzyme {
     fn process(
         &mut self,
         signal: &Signal,
-        _spore: &Spore,
         hyphae: &[&Hypha],
-        _membrane: &MembraneState,
         scorer_context: &ScorerContext,
     ) -> EnzymeDecision {
         let decision_id = self.next_decision_id();
@@ -432,14 +429,12 @@ impl Enzyme for SLNEnzyme {
 mod tests {
     use super::*;
     use crate::core::chemistry::{Chemistry, QuerySignature};
-    use crate::core::config::{QueryConfig, SporeConfig};
+    use crate::core::config::QueryConfig;
     use crate::core::hyphae::Hypha;
-    use crate::core::membrane::MembraneState;
     use crate::core::pheromone::HyphaState;
     use crate::core::signal::{Signal, Tendril};
-    use crate::core::spore::tree::Spore;
     use crate::core::types::{HyphaId, PeerAddr, TrailId};
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     fn make_hypha(
         id_byte: u8,
@@ -469,7 +464,7 @@ mod tests {
                 tau,
                 sigma,
                 consecutive_pulse_timeouts: 0,
-                forwards_count,
+                forwards_count: crate::core::pheromone::AtomicCounter::new(forwards_count),
             },
             chemistry,
             last_activity: Instant::now(),
@@ -494,21 +489,6 @@ mod tests {
 
     fn empty_scorer_context() -> ScorerContext {
         ScorerContext::new()
-    }
-
-    fn make_membrane() -> MembraneState {
-        MembraneState {
-            permeability: 1.0,
-            deep_processing_active: false,
-            buffered_count: 0,
-            floor_duration: Duration::ZERO,
-            below_sporulation_duration: Duration::ZERO,
-            total_admitted: 0,
-            total_dissolved: 0,
-            total_processed: 0,
-            admitted_rate: 0.0,
-            dissolved_rate: 0.0,
-        }
     }
 
     // -----------------------------------------------------------------------
@@ -708,11 +688,10 @@ mod tests {
     fn sln_enzyme_empty_hyphae_dissolve() {
         let mut enzyme = SLNEnzyme::with_discovery_kernels(SLNEnzymeConfig::default());
         let signal = make_tendril_signal(QuerySignature::default());
-        let spore = Spore::new(SporeConfig::default());
-        let membrane = make_membrane();
+
         let hyphae: Vec<&Hypha> = vec![];
 
-        let decision = enzyme.process(&signal, &spore, &hyphae, &membrane, &empty_scorer_context());
+        let decision = enzyme.process(&signal, &hyphae, &empty_scorer_context());
         assert_eq!(decision.action, EnzymeAction::Dissolve);
     }
 
@@ -727,13 +706,12 @@ mod tests {
         let h_bad = make_hypha(2, 1.0, 100.0, 1000, Chemistry::new());
 
         let signal = make_tendril_signal(QuerySignature::default());
-        let spore = Spore::new(SporeConfig::default());
-        let membrane = make_membrane();
+
         let hyphae: Vec<&Hypha> = vec![&h_good, &h_bad];
         let ctx = make_scorer_context(&[(&h_good, 1.0), (&h_bad, 0.0)]);
 
         let mut enzyme = SLNEnzyme::with_discovery_kernels(SLNEnzymeConfig::default());
-        let decision = enzyme.process(&signal, &spore, &hyphae, &membrane, &ctx);
+        let decision = enzyme.process(&signal, &hyphae, &ctx);
 
         assert_eq!(
             decision.action,
@@ -759,8 +737,7 @@ mod tests {
         let h_c = make_hypha(3, 2.0, 1000.0, 0, Chemistry::new());
 
         let signal = make_tendril_signal(QuerySignature::default());
-        let spore = Spore::new(SporeConfig::default());
-        let membrane = make_membrane();
+
         let hyphae: Vec<&Hypha> = vec![&h_a, &h_b, &h_c];
         let ctx = make_scorer_context(&[(&h_a, 1.0), (&h_b, 0.0), (&h_c, 0.0)]);
 
@@ -769,7 +746,7 @@ mod tests {
             ..SLNEnzymeConfig::default()
         };
         let mut enzyme = SLNEnzyme::with_discovery_kernels(config);
-        let decision = enzyme.process(&signal, &spore, &hyphae, &membrane, &ctx);
+        let decision = enzyme.process(&signal, &hyphae, &ctx);
 
         match &decision.action {
             EnzymeAction::Split { targets } => {
@@ -794,13 +771,12 @@ mod tests {
         let h_bad = make_hypha(2, 1.0, 100.0, 1000, Chemistry::new());
 
         let signal = make_tendril_signal(QuerySignature::default());
-        let spore = Spore::new(SporeConfig::default());
-        let membrane = make_membrane();
+
         let hyphae: Vec<&Hypha> = vec![&h_good, &h_bad];
         let ctx = make_scorer_context(&[(&h_good, 1.0), (&h_bad, 0.0)]);
 
         let mut enzyme = SLNEnzyme::with_discovery_kernels(SLNEnzymeConfig::default());
-        let decision = enzyme.process(&signal, &spore, &hyphae, &membrane, &ctx);
+        let decision = enzyme.process(&signal, &hyphae, &ctx);
 
         assert_eq!(
             decision.action,
@@ -814,13 +790,11 @@ mod tests {
     fn sln_enzyme_non_tendril_absorb() {
         let mut enzyme = SLNEnzyme::with_discovery_kernels(SLNEnzymeConfig::default());
         let signal = Signal::Nutrient;
-        let spore = Spore::new(SporeConfig::default());
-        let membrane = make_membrane();
 
         let h = make_hypha(1, 1.0, 0.0, 0, Chemistry::new());
         let hyphae: Vec<&Hypha> = vec![&h];
 
-        let decision = enzyme.process(&signal, &spore, &hyphae, &membrane, &empty_scorer_context());
+        let decision = enzyme.process(&signal, &hyphae, &empty_scorer_context());
         assert_eq!(decision.action, EnzymeAction::Absorb);
     }
 
@@ -979,8 +953,7 @@ mod tests {
         let h_b = make_hypha(2, 1.0, 5.0, 50, Chemistry::new());
 
         let signal = make_tendril_signal(QuerySignature::default());
-        let spore = Spore::new(SporeConfig::default());
-        let membrane = make_membrane();
+
         let hyphae: Vec<&Hypha> = vec![&h_a, &h_b];
         let ctx = make_scorer_context(&[(&h_a, 1.0), (&h_b, 0.1)]);
 
@@ -990,7 +963,7 @@ mod tests {
             ..SLNEnzymeConfig::default()
         };
         let mut enzyme_majority = SLNEnzyme::with_discovery_kernels(config_majority);
-        let dec_majority = enzyme_majority.process(&signal, &spore, &hyphae, &membrane, &ctx);
+        let dec_majority = enzyme_majority.process(&signal, &hyphae, &ctx);
         let majority_forwards = matches!(dec_majority.action, EnzymeAction::Forward { .. });
 
         // With Unanimous quorum — might Split if any kernel disagrees.
@@ -999,7 +972,7 @@ mod tests {
             ..SLNEnzymeConfig::default()
         };
         let mut enzyme_unanimous = SLNEnzyme::with_discovery_kernels(config_unanimous);
-        let dec_unanimous = enzyme_unanimous.process(&signal, &spore, &hyphae, &membrane, &ctx);
+        let dec_unanimous = enzyme_unanimous.process(&signal, &hyphae, &ctx);
         let unanimous_forwards = matches!(dec_unanimous.action, EnzymeAction::Forward { .. });
 
         if !majority_forwards {

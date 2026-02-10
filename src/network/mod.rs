@@ -9,11 +9,14 @@ mod filter;
 mod persistence;
 pub(crate) mod pipeline;
 pub(crate) mod registry;
+pub(crate) mod replay;
 mod scorer_adapter;
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
-use crate::core::config::LshConfig;
+use crate::core::config::{ExplorationConfig, LshConfig};
 use crate::core::enzyme::SLNEnzymeConfig;
 use crate::scorer::Scorer;
 
@@ -21,6 +24,21 @@ use crate::scorer::Scorer;
 pub use filter::{FilterValue, Filters};
 pub use persistence::NetworkError;
 pub use pipeline::{DiscoveryConfidence, DiscoveryResponse, DiscoveryResult, ExplainedResult};
+pub use replay::{DiscoveryEvent, EventKind, ReplayLog};
+
+/// Report on capability drift for a single agent.
+#[derive(Debug, Clone)]
+pub struct DriftReport {
+    /// Agent name.
+    pub agent_name: String,
+    /// Alignment score: average max-similarity between successful query feedback
+    /// and registered capability signatures. 1.0 = perfect alignment, 0.0 = complete drift.
+    pub alignment: f64,
+    /// Number of successful feedback records analyzed.
+    pub sample_count: usize,
+    /// Whether drift was detected (alignment < threshold).
+    pub drifted: bool,
+}
 
 // Internal imports from sub-modules.
 use enzyme_adapter::EnzymeAdapter;
@@ -42,8 +60,14 @@ pub struct LocalNetwork {
     agents: BTreeMap<String, AgentRecord>,
     /// Scorer adapter: pluggable scorer + LSH configuration.
     scorer: ScorerAdapter,
-    /// Enzyme adapter: multi-kernel reasoning + vestigial state.
-    enzyme: EnzymeAdapter,
+    /// Enzyme adapter: wrapped in Mutex for interior mutability during `discover(&self)`.
+    enzyme: Mutex<EnzymeAdapter>,
+    /// Adaptive exploration budget configuration.
+    exploration: ExplorationConfig,
+    /// Total feedback events recorded (drives exploration decay). Atomic for `&self` access.
+    total_feedback_count: AtomicU64,
+    /// Append-only replay log: Mutex for interior mutability during `discover(&self)`.
+    replay: Mutex<ReplayLog>,
 }
 
 impl LocalNetwork {
@@ -52,7 +76,10 @@ impl LocalNetwork {
         Self {
             agents: BTreeMap::new(),
             scorer: ScorerAdapter::new(LshConfig::default()),
-            enzyme: EnzymeAdapter::new(SLNEnzymeConfig::default()),
+            enzyme: Mutex::new(EnzymeAdapter::new(SLNEnzymeConfig::default())),
+            exploration: ExplorationConfig::default(),
+            total_feedback_count: AtomicU64::new(0),
+            replay: Mutex::new(ReplayLog::disabled()),
         }
     }
 
@@ -61,7 +88,10 @@ impl LocalNetwork {
         Self {
             agents: BTreeMap::new(),
             scorer: ScorerAdapter::new(lsh_config),
-            enzyme: EnzymeAdapter::new(enzyme_config),
+            enzyme: Mutex::new(EnzymeAdapter::new(enzyme_config)),
+            exploration: ExplorationConfig::default(),
+            total_feedback_count: AtomicU64::new(0),
+            replay: Mutex::new(ReplayLog::disabled()),
         }
     }
 
@@ -73,8 +103,32 @@ impl LocalNetwork {
         Self {
             agents: BTreeMap::new(),
             scorer: ScorerAdapter::with_scorer(scorer, LshConfig::default()),
-            enzyme: EnzymeAdapter::new(SLNEnzymeConfig::default()),
+            enzyme: Mutex::new(EnzymeAdapter::new(SLNEnzymeConfig::default())),
+            exploration: ExplorationConfig::default(),
+            total_feedback_count: AtomicU64::new(0),
+            replay: Mutex::new(ReplayLog::disabled()),
         }
+    }
+
+    /// Sets a custom exploration configuration.
+    pub fn with_exploration(mut self, exploration: ExplorationConfig) -> Self {
+        self.exploration = exploration;
+        self
+    }
+
+    /// Enable replay logging with the given max event capacity.
+    ///
+    /// Events are recorded for every discovery, feedback, and tick operation.
+    /// Use `replay_log()` to access the log for post-hoc analysis.
+    pub fn with_replay(self, max_events: usize) -> Self {
+        *self.replay.lock().unwrap() = ReplayLog::new(max_events);
+        self
+    }
+
+    /// Returns the current exploration epsilon based on accumulated feedback.
+    fn current_epsilon(&self) -> f64 {
+        self.exploration
+            .current_epsilon(self.total_feedback_count.load(Ordering::Relaxed))
     }
 
     // -----------------------------------------------------------------------
@@ -121,7 +175,7 @@ impl LocalNetwork {
     /// Returns a ranked list of all agents with similarity > 0, sorted by
     /// `score = similarity × diameter`. The diameter incorporates feedback
     /// from `record_success` / `record_failure`.
-    pub fn discover(&mut self, query: &str) -> Vec<DiscoveryResult> {
+    pub fn discover(&self, query: &str) -> Vec<DiscoveryResult> {
         self.discover_filtered(query, None)
     }
 
@@ -131,20 +185,42 @@ impl LocalNetwork {
     /// conditions on their metadata to appear in results. Missing metadata
     /// keys cause the filter to fail (strict mode).
     ///
-    /// Results within 5% of the top score are randomly shuffled to
-    /// distribute load across equally-capable agents.
+    /// Uses interior mutability (`Mutex` for enzyme, `AtomicU64` for counters)
+    /// so that multiple concurrent reads are safe.
     pub fn discover_filtered(
-        &mut self,
+        &self,
         query: &str,
         filters: Option<&Filters>,
     ) -> Vec<DiscoveryResult> {
+        let epsilon = self.current_epsilon();
+        self.replay
+            .lock()
+            .unwrap()
+            .record(EventKind::QuerySubmitted {
+                query: query.to_string(),
+            });
         let (candidates, _) = run_pipeline(
-            &mut self.agents,
+            &self.agents,
             &self.scorer,
-            &mut self.enzyme,
+            &mut self.enzyme.lock().unwrap(),
             query,
             filters,
+            epsilon,
         );
+        // Record agent scores in replay log.
+        {
+            let mut replay = self.replay.lock().unwrap();
+            for c in &candidates {
+                replay.record(EventKind::AgentScored {
+                    query: query.to_string(),
+                    agent_name: c.agent_name.clone(),
+                    raw_similarity: c.raw_similarity,
+                    enzyme_score: c.enzyme_score,
+                    feedback_factor: c.feedback_factor,
+                    final_score: c.final_score,
+                });
+            }
+        }
         candidates.into_iter().map(|c| c.into_result()).collect()
     }
 
@@ -154,16 +230,18 @@ impl LocalNetwork {
     /// raw similarity, diameter, feedback factor, and final score.
     /// Supports the same filters and tie-breaking as regular discover.
     pub fn discover_explained(
-        &mut self,
+        &self,
         query: &str,
         filters: Option<&Filters>,
     ) -> Vec<ExplainedResult> {
+        let epsilon = self.current_epsilon();
         let (candidates, _) = run_pipeline(
-            &mut self.agents,
+            &self.agents,
             &self.scorer,
-            &mut self.enzyme,
+            &mut self.enzyme.lock().unwrap(),
             query,
             filters,
+            epsilon,
         );
         candidates.into_iter().map(|c| c.into_explained()).collect()
     }
@@ -177,7 +255,7 @@ impl LocalNetwork {
     /// This moves the query loop from Python to Rust, avoiding per-query
     /// GIL acquisition overhead. Future versions may parallelize internally.
     pub fn discover_many(
-        &mut self,
+        &self,
         queries: &[&str],
         filters: Option<&Filters>,
     ) -> Vec<Vec<DiscoveryResult>> {
@@ -191,7 +269,7 @@ impl LocalNetwork {
     ///
     /// Like `discover_many` but returns `ExplainedResult` per match.
     pub fn discover_many_explained(
-        &mut self,
+        &self,
         queries: &[&str],
         filters: Option<&Filters>,
     ) -> Vec<Vec<ExplainedResult>> {
@@ -206,25 +284,28 @@ impl LocalNetwork {
     /// Returns a `DiscoveryResponse` containing ranked results plus a confidence
     /// level indicating kernel agreement. When kernels disagree (Split),
     /// `recommended_parallelism` suggests how many agents to invoke concurrently.
-    pub fn discover_with_confidence(&mut self, query: &str) -> DiscoveryResponse {
+    pub fn discover_with_confidence(&self, query: &str) -> DiscoveryResponse {
         self.discover_with_confidence_filtered(query, None)
     }
 
     /// Discover agents with confidence signal and optional metadata filters.
     pub fn discover_with_confidence_filtered(
-        &mut self,
+        &self,
         query: &str,
         filters: Option<&Filters>,
     ) -> DiscoveryResponse {
+        let epsilon = self.current_epsilon();
+        let mut enzyme = self.enzyme.lock().unwrap();
         let (candidates, kernel_eval) = run_pipeline(
-            &mut self.agents,
+            &self.agents,
             &self.scorer,
-            &mut self.enzyme,
+            &mut enzyme,
             query,
             filters,
+            epsilon,
         );
         let (confidence, recommended_parallelism) =
-            derive_confidence(&kernel_eval, &self.agents, self.enzyme.config());
+            derive_confidence(&kernel_eval, &self.agents, enzyme.config());
         DiscoveryResponse {
             results: candidates.into_iter().map(|c| c.into_result()).collect(),
             confidence,
@@ -242,7 +323,7 @@ impl LocalNetwork {
     /// similarity scores, then fed into the standard discovery pipeline
     /// (enzyme evaluation, feedback, tie-breaking, filtering).
     pub fn discover_query(
-        &mut self,
+        &self,
         query: &crate::query::Query,
         filters: Option<&Filters>,
     ) -> Vec<DiscoveryResult> {
@@ -254,20 +335,22 @@ impl LocalNetwork {
             }
         };
         let primary = query.primary_text().unwrap_or("");
+        let epsilon = self.current_epsilon();
         let (candidates, _) = run_pipeline_with_scores(
-            &mut self.agents,
+            &self.agents,
             &self.scorer,
-            &mut self.enzyme,
+            &mut self.enzyme.lock().unwrap(),
             primary,
             score_map,
             filters,
+            epsilon,
         );
         candidates.into_iter().map(|c| c.into_result()).collect()
     }
 
     /// Discover agents using a Query with full scoring breakdown.
     pub fn discover_query_explained(
-        &mut self,
+        &self,
         query: &crate::query::Query,
         filters: Option<&Filters>,
     ) -> Vec<ExplainedResult> {
@@ -279,20 +362,22 @@ impl LocalNetwork {
             }
         };
         let primary = query.primary_text().unwrap_or("");
+        let epsilon = self.current_epsilon();
         let (candidates, _) = run_pipeline_with_scores(
-            &mut self.agents,
+            &self.agents,
             &self.scorer,
-            &mut self.enzyme,
+            &mut self.enzyme.lock().unwrap(),
             primary,
             score_map,
             filters,
+            epsilon,
         );
         candidates.into_iter().map(|c| c.into_explained()).collect()
     }
 
     /// Discover agents using a Query with confidence signal.
     pub fn discover_query_with_confidence(
-        &mut self,
+        &self,
         query: &crate::query::Query,
         filters: Option<&Filters>,
     ) -> DiscoveryResponse {
@@ -308,16 +393,19 @@ impl LocalNetwork {
             }
         };
         let primary = query.primary_text().unwrap_or("");
+        let epsilon = self.current_epsilon();
+        let mut enzyme = self.enzyme.lock().unwrap();
         let (candidates, kernel_eval) = run_pipeline_with_scores(
-            &mut self.agents,
+            &self.agents,
             &self.scorer,
-            &mut self.enzyme,
+            &mut enzyme,
             primary,
             score_map,
             filters,
+            epsilon,
         );
         let (confidence, recommended_parallelism) =
-            derive_confidence(&kernel_eval, &self.agents, self.enzyme.config());
+            derive_confidence(&kernel_eval, &self.agents, enzyme.config());
         DiscoveryResponse {
             results: candidates.into_iter().map(|c| c.into_result()).collect(),
             confidence,
@@ -338,6 +426,15 @@ impl LocalNetwork {
     /// Global diameter adjustment always applies regardless of query.
     pub fn record_success(&mut self, agent_name: &str, query: Option<&str>) {
         registry::record_success(&mut self.agents, &self.scorer.lsh_config, agent_name, query);
+        self.total_feedback_count.fetch_add(1, Ordering::Relaxed);
+        self.replay
+            .lock()
+            .unwrap()
+            .record(EventKind::FeedbackRecorded {
+                agent_name: agent_name.to_string(),
+                query: query.map(|q| q.to_string()),
+                outcome: 1.0,
+            });
     }
 
     /// Record a failed interaction with an agent.
@@ -347,6 +444,15 @@ impl LocalNetwork {
     /// affecting unrelated query types.
     pub fn record_failure(&mut self, agent_name: &str, query: Option<&str>) {
         registry::record_failure(&mut self.agents, &self.scorer.lsh_config, agent_name, query);
+        self.total_feedback_count.fetch_add(1, Ordering::Relaxed);
+        self.replay
+            .lock()
+            .unwrap()
+            .record(EventKind::FeedbackRecorded {
+                agent_name: agent_name.to_string(),
+                query: query.map(|q| q.to_string()),
+                outcome: -1.0,
+            });
     }
 
     // -----------------------------------------------------------------------
@@ -362,6 +468,7 @@ impl LocalNetwork {
     /// an ephemeral signal.
     pub fn tick(&mut self) {
         registry::tick(&mut self.agents);
+        self.replay.lock().unwrap().record(EventKind::TickApplied);
     }
 
     // -----------------------------------------------------------------------
@@ -376,6 +483,90 @@ impl LocalNetwork {
     /// Returns all registered agent names.
     pub fn agents(&self) -> Vec<String> {
         self.agents.keys().cloned().collect()
+    }
+
+    /// Returns the current exploration epsilon (0.0 = pure exploit, 1.0 = always explore).
+    ///
+    /// Epsilon starts high (`exploration.epsilon_initial`) and decays
+    /// exponentially with each feedback event toward `epsilon_floor`.
+    pub fn exploration_epsilon(&self) -> f64 {
+        self.current_epsilon()
+    }
+
+    /// Access the replay log. Takes a closure since the log is behind a Mutex.
+    ///
+    /// Only contains events if `with_replay()` was called during construction.
+    pub fn with_replay_log<R>(&self, f: impl FnOnce(&ReplayLog) -> R) -> R {
+        f(&self.replay.lock().unwrap())
+    }
+
+    /// Access the replay log mutably (e.g. for clearing).
+    pub fn with_replay_log_mut<R>(&self, f: impl FnOnce(&mut ReplayLog) -> R) -> R {
+        f(&mut self.replay.lock().unwrap())
+    }
+
+    /// Detect capability drift for all agents.
+    ///
+    /// Compares each agent's successful query feedback signatures against its
+    /// registered capability signatures. Returns a `DriftReport` per agent with
+    /// enough feedback. Agents with fewer than `min_samples` feedback records
+    /// are skipped.
+    ///
+    /// `threshold`: alignment score below which drift is flagged (default: 0.3).
+    /// `min_samples`: minimum successful feedback records to analyze (default: 5).
+    pub fn detect_drift(&self, threshold: f64, min_samples: usize) -> Vec<DriftReport> {
+        use crate::core::lsh::{compute_semantic_signature, MinHasher};
+
+        let lsh_config = self.scorer.lsh_config();
+        let mut reports = Vec::new();
+
+        for (name, record) in &self.agents {
+            // Compute capability signatures for this agent.
+            let cap_sigs: Vec<[u8; 64]> = record
+                .capabilities
+                .iter()
+                .map(|cap| compute_semantic_signature(cap.as_bytes(), lsh_config))
+                .collect();
+
+            if cap_sigs.is_empty() {
+                continue;
+            }
+
+            // Collect successful feedback records (outcome > 0).
+            let successful: Vec<&[u8; 64]> = record
+                .feedback
+                .records()
+                .iter()
+                .filter(|fb| fb.outcome > 0.0)
+                .map(|fb| &fb.query_minhash)
+                .collect();
+
+            if successful.len() < min_samples {
+                continue;
+            }
+
+            // For each successful query, compute max similarity to any registered capability.
+            let alignment_sum: f64 = successful
+                .iter()
+                .map(|query_mh| {
+                    cap_sigs
+                        .iter()
+                        .map(|cap_sig| MinHasher::similarity(cap_sig, query_mh))
+                        .fold(0.0f64, f64::max)
+                })
+                .sum();
+
+            let alignment = alignment_sum / successful.len() as f64;
+
+            reports.push(DriftReport {
+                agent_name: name.clone(),
+                alignment,
+                sample_count: successful.len(),
+                drifted: alignment < threshold,
+            });
+        }
+
+        reports
     }
 
     /// Deterministically convert an agent name to a HyphaId.
@@ -426,7 +617,7 @@ impl LocalNetwork {
                 record.hypha.state.diameter = agent.diameter;
                 record.hypha.state.tau = agent.tau;
                 record.hypha.state.sigma = agent.sigma;
-                record.hypha.state.forwards_count = agent.forwards_count;
+                record.hypha.state.forwards_count.set(agent.forwards_count);
                 record.hypha.state.consecutive_pulse_timeouts = agent.consecutive_pulse_timeouts;
                 record.feedback = agent.feedback;
             }
@@ -455,7 +646,7 @@ mod tests {
 
     #[test]
     fn empty_network_returns_no_results() {
-        let mut network = LocalNetwork::new();
+        let network = LocalNetwork::new();
         let results = network.discover("anything");
         assert!(results.is_empty());
     }
@@ -1129,7 +1320,7 @@ mod tests {
         network.save(path).expect("save should succeed");
 
         // Load
-        let mut loaded = LocalNetwork::load(path).expect("load should succeed");
+        let loaded = LocalNetwork::load(path).expect("load should succeed");
         assert_eq!(loaded.agent_count(), 2);
         assert!(loaded.agents().contains(&"translate-agent".to_string()));
         assert!(loaded.agents().contains(&"summarize-agent".to_string()));
@@ -1165,7 +1356,7 @@ mod tests {
         let path = "/tmp/alps_test_feedback.json";
         network.save(path).expect("save should succeed");
 
-        let mut loaded = LocalNetwork::load(path).expect("load should succeed");
+        let loaded = LocalNetwork::load(path).expect("load should succeed");
         let results = loaded.discover("process data files");
         assert!(results.len() >= 2);
         let a = results.iter().find(|r| r.agent_name == "agent-a").unwrap();
@@ -1313,7 +1504,7 @@ mod tests {
 
     #[test]
     fn explain_empty_network() {
-        let mut network = LocalNetwork::new();
+        let network = LocalNetwork::new();
         let results = network.discover_explained("anything", None);
         assert!(results.is_empty());
     }
@@ -1466,7 +1657,7 @@ mod tests {
         // Simulate heavy usage of agent-stale (high sigma, high forwards).
         if let Some(record) = network.agents.get_mut("agent-stale") {
             record.hypha.state.sigma = 100.0;
-            record.hypha.state.forwards_count = 100;
+            record.hypha.state.forwards_count.set(100);
         }
 
         let results = network.discover("data processing");
@@ -1506,7 +1697,7 @@ mod tests {
         // Make math-agent worse on ALL axes: high sigma (novelty), high forwards (load-balance).
         if let Some(r) = network.agents.get_mut("math-agent") {
             r.hypha.state.sigma = 100.0;
-            r.hypha.state.forwards_count = 100;
+            r.hypha.state.forwards_count.set(100);
             r.hypha.state.diameter = 0.1;
         }
 
@@ -1553,11 +1744,11 @@ mod tests {
         // Make agent-a heavily used (high sigma + high forwards).
         if let Some(r) = network.agents.get_mut("agent-a") {
             r.hypha.state.sigma = 1000.0;
-            r.hypha.state.forwards_count = 1000;
+            r.hypha.state.forwards_count.set(1000);
         }
         // Make agent-b have high forwards (but low sigma).
         if let Some(r) = network.agents.get_mut("agent-b") {
-            r.hypha.state.forwards_count = 1000;
+            r.hypha.state.forwards_count.set(1000);
         }
         // Make agent-c have high sigma (but low forwards).
         if let Some(r) = network.agents.get_mut("agent-c") {
@@ -1618,10 +1809,10 @@ mod tests {
         // Force extreme divergence in kernel preferences.
         if let Some(r) = network.agents.get_mut("agent-a") {
             r.hypha.state.sigma = 1000.0;
-            r.hypha.state.forwards_count = 1000;
+            r.hypha.state.forwards_count.set(1000);
         }
         if let Some(r) = network.agents.get_mut("agent-b") {
-            r.hypha.state.forwards_count = 1000;
+            r.hypha.state.forwards_count.set(1000);
         }
         if let Some(r) = network.agents.get_mut("agent-c") {
             r.hypha.state.sigma = 1000.0;
@@ -1979,5 +2170,289 @@ mod tests {
         assert_eq!(results[0].agent_name, "translate");
         assert!(results[0].raw_similarity > 0.0);
         assert!(results[0].enzyme_score >= 0.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // P3.2: Adaptive Exploration Budget (Epsilon-Greedy)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn exploration_epsilon_starts_high() {
+        let network = LocalNetwork::new();
+        let epsilon = network.exploration_epsilon();
+        assert!(
+            epsilon > 0.5,
+            "initial epsilon ({:.3}) should be high (>0.5)",
+            epsilon
+        );
+    }
+
+    #[test]
+    fn exploration_epsilon_decays_with_feedback() {
+        let mut network = LocalNetwork::new();
+        reg(&mut network, "agent-a", &["data processing"]);
+
+        let epsilon_before = network.exploration_epsilon();
+
+        // Record many feedback events.
+        for _ in 0..100 {
+            network.record_success("agent-a", Some("data processing"));
+        }
+
+        let epsilon_after = network.exploration_epsilon();
+        assert!(
+            epsilon_after < epsilon_before,
+            "epsilon should decay: before={:.3}, after={:.3}",
+            epsilon_before,
+            epsilon_after
+        );
+    }
+
+    #[test]
+    fn exploration_epsilon_has_floor() {
+        let mut network = LocalNetwork::new();
+        reg(&mut network, "agent-a", &["data processing"]);
+
+        // Record a huge number of feedback events.
+        for _ in 0..10000 {
+            network.record_success("agent-a", None);
+        }
+
+        let epsilon = network.exploration_epsilon();
+        assert!(
+            epsilon >= 0.05,
+            "epsilon ({:.4}) should not drop below floor (0.05)",
+            epsilon
+        );
+        assert!(
+            epsilon < 0.1,
+            "epsilon ({:.4}) should be near floor after many feedbacks",
+            epsilon
+        );
+    }
+
+    #[test]
+    fn custom_exploration_config() {
+        use crate::core::config::ExplorationConfig;
+        let network = LocalNetwork::new().with_exploration(ExplorationConfig {
+            epsilon_initial: 1.0,
+            epsilon_floor: 0.01,
+            epsilon_decay_rate: 0.95,
+        });
+        assert!((network.exploration_epsilon() - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn low_epsilon_reduces_exploration() {
+        use crate::core::config::ExplorationConfig;
+        // With epsilon=0 (pure exploit), agents with different scores should never
+        // be shuffled out of order. True ties (identical scores) are still shuffled
+        // for fair distribution — that's correct behavior.
+        //
+        // This test verifies that epsilon=0 prevents CI-overlap exploration from
+        // promoting weaker agents above stronger ones.
+        let mut network = LocalNetwork::new().with_exploration(ExplorationConfig {
+            epsilon_initial: 0.0,
+            epsilon_floor: 0.0,
+            epsilon_decay_rate: 1.0,
+        });
+        reg(
+            &mut network,
+            "strong-agent",
+            &["legal translation", "EN-DE", "contract law"],
+        );
+        reg(&mut network, "weak-agent", &["code review", "testing"]);
+
+        // With epsilon=0, the more-relevant agent should always rank first.
+        for _ in 0..20 {
+            let results = network.discover("legal translation services");
+            assert!(!results.is_empty());
+            assert_eq!(
+                results[0].agent_name, "strong-agent",
+                "with epsilon=0, higher-scoring agent should always rank first"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // P3.3: Capability Drift Detection
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn drift_no_feedback_skips_agent() {
+        let mut network = LocalNetwork::new();
+        reg(&mut network, "agent-a", &["legal translation"]);
+
+        // No feedback recorded → agent skipped (min_samples default 5).
+        let reports = network.detect_drift(0.3, 5);
+        assert!(
+            reports.is_empty(),
+            "should skip agents with insufficient feedback"
+        );
+    }
+
+    #[test]
+    fn drift_aligned_feedback_reports_no_drift() {
+        let mut network = LocalNetwork::new();
+        reg(&mut network, "agent-a", &["legal translation services"]);
+
+        // Record successes with queries similar to registered capability.
+        for _ in 0..10 {
+            network.record_success("agent-a", Some("legal translation"));
+        }
+
+        let reports = network.detect_drift(0.3, 5);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].agent_name, "agent-a");
+        assert!(
+            !reports[0].drifted,
+            "aligned feedback should not trigger drift (alignment={:.3})",
+            reports[0].alignment
+        );
+        assert!(
+            reports[0].alignment > 0.3,
+            "alignment ({:.3}) should be above threshold",
+            reports[0].alignment
+        );
+    }
+
+    #[test]
+    fn drift_misaligned_feedback_reports_drift() {
+        let mut network = LocalNetwork::new();
+        reg(
+            &mut network,
+            "agent-a",
+            &["legal translation services for contracts"],
+        );
+
+        // Record successes with queries VERY different from registered capability.
+        // Use unrelated queries so MinHash similarity is near zero.
+        for i in 0..10 {
+            network.record_success(
+                "agent-a",
+                Some(&format!("calculate fibonacci numbers recursively {}", i)),
+            );
+        }
+
+        let reports = network.detect_drift(0.3, 5);
+        assert_eq!(reports.len(), 1);
+        assert!(
+            reports[0].drifted,
+            "misaligned feedback should trigger drift (alignment={:.3})",
+            reports[0].alignment
+        );
+    }
+
+    #[test]
+    fn drift_sample_count_reflects_positive_feedback() {
+        let mut network = LocalNetwork::new();
+        reg(&mut network, "agent-a", &["data processing"]);
+
+        // Record 5 successes and 5 failures.
+        for _ in 0..5 {
+            network.record_success("agent-a", Some("data processing"));
+        }
+        for _ in 0..5 {
+            network.record_failure("agent-a", Some("data processing"));
+        }
+
+        let reports = network.detect_drift(0.3, 5);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(
+            reports[0].sample_count, 5,
+            "only successful feedback should count"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // P3.4: Discovery Replay / Time-Travel Debugging
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn replay_disabled_by_default() {
+        let network = LocalNetwork::new();
+        network.with_replay_log(|log| assert!(!log.is_enabled()));
+    }
+
+    #[test]
+    fn replay_records_discovery_events() {
+        let mut network = LocalNetwork::new().with_replay(1000);
+        reg(&mut network, "agent-a", &["legal translation"]);
+
+        network.discover("legal translation");
+
+        network.with_replay_log(|log| {
+            assert!(log.is_enabled());
+            assert!(
+                log.len() >= 2,
+                "should have QuerySubmitted + AgentScored events, got {}",
+                log.len()
+            );
+            let query_events = log.query_history("legal translation");
+            assert!(!query_events.is_empty(), "should have events for the query");
+        });
+    }
+
+    #[test]
+    fn replay_records_feedback_events() {
+        let mut network = LocalNetwork::new().with_replay(1000);
+        reg(&mut network, "agent-a", &["data processing"]);
+
+        network.record_success("agent-a", Some("data processing"));
+        network.record_failure("agent-a", Some("bad query"));
+
+        network.with_replay_log(|log| {
+            let agent_events = log.agent_history("agent-a");
+            assert_eq!(
+                agent_events.len(),
+                2,
+                "should have 2 feedback events for agent-a"
+            );
+        });
+    }
+
+    #[test]
+    fn replay_records_tick_events() {
+        let mut network = LocalNetwork::new().with_replay(1000);
+        reg(&mut network, "agent-a", &["data processing"]);
+
+        network.tick();
+        network.tick();
+
+        network.with_replay_log(|log| {
+            let tick_count = log
+                .events()
+                .iter()
+                .filter(|e| matches!(e.kind, EventKind::TickApplied))
+                .count();
+            assert_eq!(tick_count, 2);
+        });
+    }
+
+    #[test]
+    fn replay_clear_works() {
+        let mut network = LocalNetwork::new().with_replay(1000);
+        reg(&mut network, "agent-a", &["data processing"]);
+        network.discover("data processing");
+        network.with_replay_log(|log| assert!(!log.is_empty()));
+
+        network.with_replay_log_mut(|log| log.clear());
+        network.with_replay_log(|log| assert_eq!(log.len(), 0));
+    }
+
+    // -----------------------------------------------------------------------
+    // P3.1: Interior Mutability — verify discover(&self) works
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn discover_takes_shared_ref() {
+        let mut network = LocalNetwork::new();
+        reg(&mut network, "agent-a", &["legal translation"]);
+
+        // This test verifies discover() takes &self (not &mut self).
+        // If this compiles, the interior mutability change is correct.
+        let network_ref: &LocalNetwork = &network;
+        let results = network_ref.discover("legal translation");
+        assert!(!results.is_empty());
     }
 }

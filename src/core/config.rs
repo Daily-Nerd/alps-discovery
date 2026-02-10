@@ -89,6 +89,40 @@ impl Default for QueryConfig {
     }
 }
 
+/// Configuration for the adaptive exploration budget (epsilon-greedy).
+///
+/// Controls the explore/exploit trade-off in tie-breaking. When agents
+/// have overlapping confidence intervals, exploration (random shuffle)
+/// happens with probability `epsilon`. Epsilon decays as feedback
+/// accumulates: `epsilon = max(floor, initial × decay_rate^feedback_count)`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExplorationConfig {
+    /// Starting exploration probability (default: 0.8 — heavy exploration early).
+    pub epsilon_initial: f64,
+    /// Minimum exploration probability (default: 0.05 — always some exploration).
+    pub epsilon_floor: f64,
+    /// Exponential decay rate per feedback event (default: 0.99).
+    pub epsilon_decay_rate: f64,
+}
+
+impl Default for ExplorationConfig {
+    fn default() -> Self {
+        Self {
+            epsilon_initial: 0.8,
+            epsilon_floor: 0.05,
+            epsilon_decay_rate: 0.99,
+        }
+    }
+}
+
+impl ExplorationConfig {
+    /// Compute current epsilon given total feedback count.
+    pub fn current_epsilon(&self, feedback_count: u64) -> f64 {
+        let epsilon = self.epsilon_initial * self.epsilon_decay_rate.powi(feedback_count as i32);
+        epsilon.max(self.epsilon_floor)
+    }
+}
+
 /// Configuration for the spore (placeholder for enzyme trait signature).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SporeConfig {

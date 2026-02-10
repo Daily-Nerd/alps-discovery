@@ -19,5 +19,6 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<pybridge::PyExplainedResult>()?;
     m.add_class::<pybridge::PyDiscoveryResponse>()?;
     m.add_class::<pybridge::PyQuery>()?;
+    m.add_class::<pybridge::PyTfIdfScorer>()?;
     Ok(())
 }

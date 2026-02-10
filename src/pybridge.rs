@@ -11,7 +11,7 @@ use pyo3::IntoPyObject;
 use crate::core::config::LshConfig;
 use crate::core::enzyme::SLNEnzymeConfig;
 use crate::network::LocalNetwork;
-use crate::scorer::Scorer;
+use crate::scorer::{Scorer, TfIdfScorer};
 
 /// Python scorer wrapper implementing the Rust Scorer trait.
 ///
@@ -101,8 +101,15 @@ impl PyLocalNetwork {
     #[pyo3(signature = (*, similarity_threshold=None, scorer=None))]
     fn new(similarity_threshold: Option<f64>, scorer: Option<Py<PyAny>>) -> Self {
         let inner = if let Some(py_scorer) = scorer {
-            let scorer = PyScorer { inner: py_scorer };
-            LocalNetwork::with_scorer(Box::new(scorer))
+            // Check if it's our built-in TfIdfScorer first.
+            let is_tfidf =
+                Python::attach(|py| py_scorer.bind(py).is_instance_of::<PyTfIdfScorer>());
+            if is_tfidf {
+                LocalNetwork::with_scorer(Box::new(TfIdfScorer::new()))
+            } else {
+                let scorer = PyScorer { inner: py_scorer };
+                LocalNetwork::with_scorer(Box::new(scorer))
+            }
         } else {
             let mut lsh_config = LshConfig::default();
             if let Some(t) = similarity_threshold {
@@ -339,6 +346,132 @@ impl PyLocalNetwork {
     /// List of all registered agent names.
     fn agents(&self) -> Vec<String> {
         self.inner.agents()
+    }
+
+    /// Current exploration epsilon value.
+    ///
+    /// Starts high (default 0.8) and decays with feedback. Controls the
+    /// probability of random exploration vs. deterministic ranking during
+    /// tie-breaking.
+    #[getter]
+    fn exploration_epsilon(&self) -> f64 {
+        self.inner.exploration_epsilon()
+    }
+
+    /// Enable the discovery replay log for post-hoc analysis.
+    ///
+    /// After enabling, all discover(), record_success/failure(), and tick()
+    /// operations are recorded. Use replay_events() to retrieve the log.
+    ///
+    /// Args:
+    ///     max_events: Maximum number of events to keep (default: 10000).
+    #[pyo3(signature = (max_events=10000))]
+    fn enable_replay(&mut self, max_events: usize) {
+        self.inner.with_replay_log_mut(|log| {
+            *log = crate::network::replay::ReplayLog::new(max_events);
+        });
+    }
+
+    /// Number of events in the replay log.
+    #[getter]
+    fn replay_event_count(&self) -> usize {
+        self.inner.with_replay_log(|log| log.len())
+    }
+
+    /// Whether the replay log is enabled.
+    #[getter]
+    fn replay_enabled(&self) -> bool {
+        self.inner.with_replay_log(|log| log.is_enabled())
+    }
+
+    /// Retrieve replay events as a list of dicts.
+    ///
+    /// Each event is a dict with keys: "type", "query", "agent_name",
+    /// "raw_similarity", "enzyme_score", "feedback_factor", "final_score",
+    /// "outcome" (depending on event type).
+    fn replay_events(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
+        self.inner.with_replay_log(|log| {
+            let events: Vec<Py<PyAny>> = log
+                .events()
+                .iter()
+                .map(|event| {
+                    let dict = pyo3::types::PyDict::new(py);
+                    match &event.kind {
+                        crate::network::replay::EventKind::QuerySubmitted { query } => {
+                            dict.set_item("type", "query_submitted").unwrap();
+                            dict.set_item("query", query).unwrap();
+                        }
+                        crate::network::replay::EventKind::AgentScored {
+                            query,
+                            agent_name,
+                            raw_similarity,
+                            enzyme_score,
+                            feedback_factor,
+                            final_score,
+                        } => {
+                            dict.set_item("type", "agent_scored").unwrap();
+                            dict.set_item("query", query).unwrap();
+                            dict.set_item("agent_name", agent_name).unwrap();
+                            dict.set_item("raw_similarity", raw_similarity).unwrap();
+                            dict.set_item("enzyme_score", enzyme_score).unwrap();
+                            dict.set_item("feedback_factor", feedback_factor).unwrap();
+                            dict.set_item("final_score", final_score).unwrap();
+                        }
+                        crate::network::replay::EventKind::FeedbackRecorded {
+                            agent_name,
+                            query,
+                            outcome,
+                        } => {
+                            dict.set_item("type", "feedback_recorded").unwrap();
+                            dict.set_item("agent_name", agent_name).unwrap();
+                            dict.set_item("query", query.as_deref().unwrap_or(""))
+                                .unwrap();
+                            dict.set_item("outcome", outcome).unwrap();
+                        }
+                        crate::network::replay::EventKind::TickApplied => {
+                            dict.set_item("type", "tick_applied").unwrap();
+                        }
+                    }
+                    dict.into_any().unbind()
+                })
+                .collect();
+            Ok(events)
+        })
+    }
+
+    /// Clear the replay log.
+    fn replay_clear(&mut self) {
+        self.inner.with_replay_log_mut(|log| log.clear());
+    }
+
+    /// Detect capability drift for registered agents.
+    ///
+    /// Returns a list of dicts, one per agent with enough feedback data.
+    /// Each dict has: agent_name, alignment, sample_count, drifted.
+    ///
+    /// Args:
+    ///     threshold: Alignment below this triggers drift flag (default: 0.3).
+    ///     min_samples: Minimum feedback records required (default: 5).
+    #[pyo3(signature = (*, threshold=0.3, min_samples=5))]
+    fn detect_drift(
+        &self,
+        py: Python<'_>,
+        threshold: f64,
+        min_samples: usize,
+    ) -> PyResult<Vec<Py<PyAny>>> {
+        let reports = self.inner.detect_drift(threshold, min_samples);
+        let result: Vec<Py<PyAny>> = reports
+            .into_iter()
+            .map(|r| {
+                let dict = pyo3::types::PyDict::new(py);
+                dict.set_item("agent_name", r.agent_name).unwrap();
+                dict.set_item("alignment", r.alignment).unwrap();
+                dict.set_item("sample_count", r.sample_count).unwrap();
+                dict.set_item("drifted", r.drifted).unwrap();
+                dict.into_any().unbind()
+            })
+            .collect();
+        Ok(result)
     }
 
     /// Save the network state to a JSON file.
@@ -848,6 +981,33 @@ impl PyQuery {
 
     fn __repr__(&self) -> String {
         format!("Query({:?})", self.inner)
+    }
+}
+
+/// Built-in TF-IDF scorer for semantic matching.
+///
+/// Weights rare domain terms higher than common words. Pass to
+/// ``LocalNetwork(scorer=TfIdfScorer())`` to use instead of the default MinHash.
+///
+/// Example:
+///     scorer = TfIdfScorer()
+///     network = LocalNetwork(scorer=scorer)
+#[pyclass(name = "TfIdfScorer")]
+pub struct PyTfIdfScorer {
+    _inner: TfIdfScorer,
+}
+
+#[pymethods]
+impl PyTfIdfScorer {
+    #[new]
+    fn new() -> Self {
+        Self {
+            _inner: TfIdfScorer::new(),
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        "TfIdfScorer()".to_string()
     }
 }
 

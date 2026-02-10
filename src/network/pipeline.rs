@@ -4,7 +4,7 @@
 // Takes pre-computed scorer output and enzyme evaluation,
 // combines with feedback and filters, produces ranked results.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap};
 
 use crate::core::action::EnzymeAction;
 use crate::core::config::QueryConfig;
@@ -16,7 +16,7 @@ use crate::core::types::{HyphaId, KernelType, TrailId};
 
 use super::enzyme_adapter::EnzymeAdapter;
 use super::filter::Filters;
-use super::registry::{AgentRecord, FeedbackRecord};
+use super::registry::{AgentRecord, FeedbackIndex};
 use super::scorer_adapter::ScorerAdapter;
 
 /// Strength of per-query feedback adjustment to diameter (max +/-20%).
@@ -151,12 +151,13 @@ pub(crate) fn similarity_to_ci(sim: f64) -> ConfidenceInterval {
     }
 }
 
-/// Compute per-query feedback factor for an agent.
+/// Compute per-query feedback factor for an agent using banded LSH index.
 ///
-/// Returns a value in [-1.0, 1.0] representing how well this agent has
-/// performed on queries similar to the current one.
+/// Uses the FeedbackIndex to find near-neighbor feedback records in O(k)
+/// instead of scanning all records in O(n). Returns a value in [-1.0, 1.0]
+/// representing how well this agent has performed on similar queries.
 pub(crate) fn compute_feedback_factor(
-    feedback: &VecDeque<FeedbackRecord>,
+    feedback: &FeedbackIndex,
     query_minhash: &[u8; 64],
     relevance_threshold: f64,
 ) -> f64 {
@@ -167,7 +168,10 @@ pub(crate) fn compute_feedback_factor(
     let mut weighted_sum = 0.0;
     let mut weight_sum = 0.0;
 
-    for fb in feedback {
+    // Use banded LSH to find candidate near-neighbors.
+    let candidates = feedback.find_candidates(query_minhash);
+
+    for fb in candidates {
         let relevance = MinHasher::similarity(&fb.query_minhash, query_minhash);
         if relevance >= relevance_threshold {
             weighted_sum += relevance * fb.outcome;
@@ -246,12 +250,14 @@ pub(crate) fn derive_confidence(
 /// Run the discovery pipeline for a string query.
 ///
 /// Scores all agents via the scorer, then delegates to `run_pipeline_with_scores`.
+/// `exploration_epsilon` controls the probability of shuffling tied agents (0.0 = pure exploit, 1.0 = always explore).
 pub(crate) fn run_pipeline(
-    agents: &mut BTreeMap<String, AgentRecord>,
+    agents: &BTreeMap<String, AgentRecord>,
     scorer: &ScorerAdapter,
     enzyme: &mut EnzymeAdapter,
     query: &str,
     filters: Option<&Filters>,
+    exploration_epsilon: f64,
 ) -> (Vec<ScoredCandidate>, KernelEvaluation) {
     let raw_scores = match scorer.score(query) {
         Ok(scores) => scores,
@@ -267,7 +273,15 @@ pub(crate) fn run_pipeline(
         }
     };
     let score_map: HashMap<String, f64> = raw_scores.into_iter().collect();
-    run_pipeline_with_scores(agents, scorer, enzyme, query, score_map, filters)
+    run_pipeline_with_scores(
+        agents,
+        scorer,
+        enzyme,
+        query,
+        score_map,
+        filters,
+        exploration_epsilon,
+    )
 }
 
 /// Inner discovery pipeline operating on pre-computed scores.
@@ -275,12 +289,13 @@ pub(crate) fn run_pipeline(
 /// `query_text` is used for the Signal/Tendril construction and feedback matching.
 /// `score_map` provides per-agent similarity scores (from Scorer or Query algebra).
 pub(crate) fn run_pipeline_with_scores(
-    agents: &mut BTreeMap<String, AgentRecord>,
+    agents: &BTreeMap<String, AgentRecord>,
     scorer: &ScorerAdapter,
     enzyme: &mut EnzymeAdapter,
     query_text: &str,
     score_map: HashMap<String, f64>,
     filters: Option<&Filters>,
+    exploration_epsilon: f64,
 ) -> (Vec<ScoredCandidate>, KernelEvaluation) {
     if agents.is_empty() {
         return (
@@ -379,28 +394,72 @@ pub(crate) fn run_pipeline_with_scores(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    // Randomized tie-breaking: shuffle agents whose similarity CIs overlap
-    // with the top agent.
+    // Adaptive exploration: two-tier tie-breaking.
+    //
+    // Tier 1 — TRUE TIES: agents with identical scores (within float epsilon) are
+    // ALWAYS shuffled for fair distribution. This ensures equally-qualified agents
+    // get equal opportunity regardless of registration order.
+    //
+    // Tier 2 — EXPLORATION: with probability `exploration_epsilon`, extend the shuffle
+    // to the wider CI-overlap group. This allows discovering agents whose confidence
+    // intervals overlap the top agent but whose point estimates differ. As epsilon
+    // decays with feedback, exploration narrows toward pure exploitation.
     if refs.len() > 1 {
+        use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+        use xxhash_rust::xxh3::xxh3_64_with_seed;
+
+        // Monotonic counter for unique seeds across calls. Avoids SystemTime
+        // clock resolution issues that caused repeated seeds on fast calls.
+        static TIE_BREAK_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+        let top_score = refs[0].final_score;
+
+        // Threshold for "effectively identical" scores. Must be large enough to
+        // absorb floating-point noise from enzyme kernel evaluation (temporal
+        // recency kernel introduces ~1e-6 differences between agents registered
+        // microseconds apart), but small enough not to conflate genuinely
+        // different capability matches.
+        const STRICT_TIE_EPSILON: f64 = 1e-4;
+
+        let strict_tie_count = refs
+            .iter()
+            .take_while(|r| (r.final_score - top_score).abs() < STRICT_TIE_EPSILON)
+            .count();
+
         let top_ci = &refs[0].similarity_ci;
-        let tie_count = refs
+        let ci_tie_count = refs
             .iter()
             .take_while(|r| r.similarity_ci.overlaps(top_ci))
             .count();
-        if tie_count > 1 {
-            use std::time::SystemTime;
-            use xxhash_rust::xxh3::xxh3_64_with_seed;
-            let time_seed = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0);
-            let base_seed = xxh3_64_with_seed(query_text.as_bytes(), time_seed);
 
-            let tie_slice = &mut refs[..tie_count];
-            for i in (1..tie_slice.len()).rev() {
-                let j_seed = base_seed.wrapping_add(i as u64);
-                let j = (xxh3_64_with_seed(&i.to_le_bytes(), j_seed) as usize) % (i + 1);
-                tie_slice.swap(i, j);
+        // Start with strict ties (always shuffled for fairness).
+        let mut shuffle_count = strict_tie_count;
+
+        // Epsilon extends to CI-overlap group for exploration.
+        if ci_tie_count > shuffle_count && exploration_epsilon > 0.0 {
+            let counter = TIE_BREAK_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
+            let explore_seed = xxh3_64_with_seed(query_text.as_bytes(), counter);
+            let explore_roll = (explore_seed % 1000) as f64 / 1000.0;
+            if explore_roll < exploration_epsilon {
+                shuffle_count = ci_tie_count;
+            }
+        }
+
+        if shuffle_count > 1 {
+            let counter = TIE_BREAK_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
+            let base_seed = xxh3_64_with_seed(query_text.as_bytes(), counter);
+
+            let shuffle_slice = &mut refs[..shuffle_count];
+            // Fisher-Yates shuffle using splitmix64 PRNG.
+            let mut rng_state = base_seed;
+            for i in (1..shuffle_slice.len()).rev() {
+                rng_state = rng_state.wrapping_add(0x9e3779b97f4a7c15);
+                let mut z = rng_state;
+                z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+                z ^= z >> 31;
+                let j = (z as usize) % (i + 1);
+                shuffle_slice.swap(i, j);
             }
         }
     }
@@ -431,9 +490,9 @@ pub(crate) fn run_pipeline_with_scores(
         _ => vec![],
     };
     for hypha_id in &picked {
-        for record in agents.values_mut() {
+        for record in agents.values() {
             if record.hypha.id == *hypha_id {
-                record.hypha.state.forwards_count += 1;
+                record.hypha.state.forwards_count.increment();
             }
         }
     }
@@ -472,16 +531,17 @@ mod tests {
 
     #[test]
     fn feedback_factor_empty_is_zero() {
-        let feedback = VecDeque::new();
+        let feedback = FeedbackIndex::new();
         let minhash = [0u8; 64];
         assert_eq!(compute_feedback_factor(&feedback, &minhash, 0.1), 0.0);
     }
 
     #[test]
     fn feedback_factor_positive() {
-        let mut feedback = VecDeque::new();
+        use crate::network::registry::FeedbackRecord;
+        let mut feedback = FeedbackIndex::new();
         let minhash = [42u8; 64];
-        feedback.push_back(FeedbackRecord {
+        feedback.insert(FeedbackRecord {
             query_minhash: minhash,
             outcome: 1.0,
         });
