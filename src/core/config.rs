@@ -119,6 +119,37 @@ impl ExplorationConfig {
         let epsilon = self.epsilon_initial * self.epsilon_decay_rate.powf(feedback_count as f64);
         epsilon.clamp(self.epsilon_floor, self.epsilon_initial)
     }
+
+    /// Validate configuration parameters (Requirement 11).
+    ///
+    /// # Errors
+    ///
+    /// Returns `DiscoveryError::Config` if:
+    /// - epsilon_initial < epsilon_floor
+    /// - epsilon_floor <= 0
+    /// - epsilon_decay_rate <= 0 or > 1.0
+    pub fn validate(&self) -> Result<(), crate::error::DiscoveryError> {
+        use crate::error::DiscoveryError;
+
+        if self.epsilon_floor <= 0.0 {
+            return Err(DiscoveryError::Config(
+                "epsilon_floor must be > 0".to_string(),
+            ));
+        }
+        if self.epsilon_initial < self.epsilon_floor {
+            return Err(DiscoveryError::Config(format!(
+                "epsilon_initial ({}) must be >= epsilon_floor ({})",
+                self.epsilon_initial, self.epsilon_floor
+            )));
+        }
+        if self.epsilon_decay_rate <= 0.0 || self.epsilon_decay_rate > 1.0 {
+            return Err(DiscoveryError::Config(format!(
+                "epsilon_decay_rate must be in (0, 1], got {}",
+                self.epsilon_decay_rate
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -157,5 +188,67 @@ mod tests {
         // After many feedbacks, should approach floor
         let epsilon_large = config.current_epsilon(10_000);
         assert!((epsilon_large - config.epsilon_floor).abs() < 0.01);
+    }
+
+    // -----------------------------------------------------------------------
+    // Configuration Validation (Requirement 11)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn exploration_config_rejects_initial_below_floor() {
+        use crate::error::DiscoveryError;
+        let config = ExplorationConfig {
+            epsilon_initial: 0.01,
+            epsilon_floor: 0.05,
+            epsilon_decay_rate: 0.99,
+        };
+        let result = config.validate();
+        assert!(matches!(result, Err(DiscoveryError::Config(_))));
+        assert!(result.unwrap_err().to_string().contains("floor"));
+    }
+
+    #[test]
+    fn exploration_config_rejects_zero_floor() {
+        use crate::error::DiscoveryError;
+        let config = ExplorationConfig {
+            epsilon_initial: 0.8,
+            epsilon_floor: 0.0,
+            epsilon_decay_rate: 0.99,
+        };
+        let result = config.validate();
+        assert!(matches!(result, Err(DiscoveryError::Config(_))));
+        assert!(result.unwrap_err().to_string().contains("floor"));
+    }
+
+    #[test]
+    fn exploration_config_rejects_invalid_decay_rate() {
+        use crate::error::DiscoveryError;
+        let config = ExplorationConfig {
+            epsilon_initial: 0.8,
+            epsilon_floor: 0.05,
+            epsilon_decay_rate: 1.5, // > 1.0 invalid
+        };
+        let result = config.validate();
+        assert!(matches!(result, Err(DiscoveryError::Config(_))));
+        assert!(result.unwrap_err().to_string().contains("decay"));
+    }
+
+    #[test]
+    fn exploration_config_rejects_zero_decay_rate() {
+        use crate::error::DiscoveryError;
+        let config = ExplorationConfig {
+            epsilon_initial: 0.8,
+            epsilon_floor: 0.05,
+            epsilon_decay_rate: 0.0,
+        };
+        let result = config.validate();
+        assert!(matches!(result, Err(DiscoveryError::Config(_))));
+    }
+
+    #[test]
+    fn exploration_config_accepts_valid_parameters() {
+        let config = ExplorationConfig::default();
+        let result = config.validate();
+        assert!(result.is_ok());
     }
 }

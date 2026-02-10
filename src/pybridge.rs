@@ -143,12 +143,14 @@ impl PyLocalNetwork {
         invoke: Option<Py<PyAny>>,
     ) {
         let caps: Vec<&str> = capabilities.iter().map(|s| s.as_str()).collect();
-        self.inner.register(
-            name,
-            &caps,
-            endpoint.as_deref(),
-            metadata.unwrap_or_default(),
-        );
+        self.inner
+            .register(
+                name,
+                &caps,
+                endpoint.as_deref(),
+                metadata.unwrap_or_default(),
+            )
+            .expect("Python bridge registration should not fail with validated inputs");
 
         if let Some(callable) = invoke {
             self.invocables.insert(name.to_string(), callable);

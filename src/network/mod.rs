@@ -174,6 +174,13 @@ impl LocalNetwork {
     /// pairs like protocol, version, framework) that will be returned in
     /// discovery results. ALPS does not interpret these — they are passed
     /// through so the caller can invoke the agent using their own client.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DiscoveryError::Config` if:
+    /// - Agent name is empty
+    /// - Capabilities list is empty
+    /// - Agent name exceeds 256 characters
     #[tracing::instrument(skip(self, metadata), fields(agent_name = name, capability_count = capabilities.len()))]
     pub fn register(
         &mut self,
@@ -181,7 +188,26 @@ impl LocalNetwork {
         capabilities: &[&str],
         endpoint: Option<&str>,
         metadata: HashMap<String, String>,
-    ) {
+    ) -> Result<(), crate::error::DiscoveryError> {
+        use crate::error::DiscoveryError;
+
+        // Input validation (Requirement 11)
+        if name.is_empty() {
+            return Err(DiscoveryError::Config(
+                "Agent name cannot be empty".to_string(),
+            ));
+        }
+        if capabilities.is_empty() {
+            return Err(DiscoveryError::Config(
+                "Capabilities list cannot be empty".to_string(),
+            ));
+        }
+        if name.len() > 256 {
+            return Err(DiscoveryError::Config(format!(
+                "Agent name exceeds 256 characters (got {})",
+                name.len()
+            )));
+        }
         let lsh_config = self.scorer.lsh_config().clone();
         registry::register_agent(
             &mut self.agents,
@@ -192,6 +218,7 @@ impl LocalNetwork {
             endpoint,
             metadata,
         );
+        Ok(())
     }
 
     /// Deregister an agent by name. Returns true if found and removed.
@@ -643,12 +670,19 @@ impl LocalNetwork {
 
         for agent in agents_data {
             let caps: Vec<&str> = agent.capabilities.iter().map(|s| s.as_str()).collect();
-            network.register(
-                &agent.name,
-                &caps,
-                agent.endpoint.as_deref(),
-                agent.metadata,
-            );
+            network
+                .register(
+                    &agent.name,
+                    &caps,
+                    agent.endpoint.as_deref(),
+                    agent.metadata,
+                )
+                .map_err(|e| {
+                    NetworkError::Serialization(serde_json::Error::io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("Failed to register agent during load: {}", e),
+                    )))
+                })?;
 
             // Restore scoring state (register() sets defaults, so override).
             if let Some(record) = network.agents.get_mut(&agent.name) {
@@ -679,7 +713,9 @@ mod tests {
 
     /// Helper: register with no endpoint/metadata.
     fn reg(network: &mut LocalNetwork, name: &str, caps: &[&str]) {
-        network.register(name, caps, None, HashMap::new());
+        network
+            .register(name, caps, None, HashMap::new())
+            .expect("registration should succeed in tests");
     }
 
     #[test]
@@ -848,12 +884,14 @@ mod tests {
         let mut meta = HashMap::new();
         meta.insert("protocol".to_string(), "mcp".to_string());
         meta.insert("version".to_string(), "1.0".to_string());
-        network.register(
-            "translate-agent",
-            &["legal translation"],
-            Some("http://localhost:8080/translate"),
-            meta,
-        );
+        network
+            .register(
+                "translate-agent",
+                &["legal translation"],
+                Some("http://localhost:8080/translate"),
+                meta,
+            )
+            .expect("test registration");
         reg(&mut network, "bare-agent", &["legal translation"]);
 
         let results = network.discover("legal translation");
@@ -1086,8 +1124,12 @@ mod tests {
             scores: HashMap::new(),
         };
         let mut network = LocalNetwork::with_scorer(Box::new(scorer));
-        network.register("agent-a", &["anything"], None, HashMap::new());
-        network.register("agent-b", &["anything"], None, HashMap::new());
+        network
+            .register("agent-a", &["anything"], None, HashMap::new())
+            .expect("test registration");
+        network
+            .register("agent-b", &["anything"], None, HashMap::new())
+            .expect("test registration");
 
         let results = network.discover("any query");
         assert_eq!(results.len(), 2);
@@ -1115,8 +1157,12 @@ mod tests {
         }
 
         let mut network = LocalNetwork::with_scorer(Box::new(RankedMockScorer));
-        network.register("agent-high", &["x"], None, HashMap::new());
-        network.register("agent-low", &["y"], None, HashMap::new());
+        network
+            .register("agent-high", &["x"], None, HashMap::new())
+            .expect("test registration");
+        network
+            .register("agent-low", &["y"], None, HashMap::new())
+            .expect("test registration");
 
         let results = network.discover("test");
         assert_eq!(results.len(), 2);
@@ -1129,11 +1175,15 @@ mod tests {
         let mut network = LocalNetwork::new();
         let mut meta_mcp = HashMap::new();
         meta_mcp.insert("protocol".to_string(), "mcp".to_string());
-        network.register("agent-mcp", &["legal translation"], None, meta_mcp);
+        network
+            .register("agent-mcp", &["legal translation"], None, meta_mcp)
+            .expect("test registration");
 
         let mut meta_rest = HashMap::new();
         meta_rest.insert("protocol".to_string(), "rest".to_string());
-        network.register("agent-rest", &["legal translation"], None, meta_rest);
+        network
+            .register("agent-rest", &["legal translation"], None, meta_rest)
+            .expect("test registration");
 
         let mut filters = Filters::new();
         filters.insert(
@@ -1154,9 +1204,13 @@ mod tests {
             "description".to_string(),
             "fast translation service".to_string(),
         );
-        network.register("agent-a", &["legal translation"], None, meta);
+        network
+            .register("agent-a", &["legal translation"], None, meta)
+            .expect("test registration");
 
-        network.register("agent-b", &["legal translation"], None, HashMap::new());
+        network
+            .register("agent-b", &["legal translation"], None, HashMap::new())
+            .expect("test registration");
 
         let mut filters = Filters::new();
         filters.insert(
@@ -1174,15 +1228,21 @@ mod tests {
         let mut network = LocalNetwork::new();
         let mut meta1 = HashMap::new();
         meta1.insert("protocol".to_string(), "mcp".to_string());
-        network.register("agent-mcp", &["legal translation"], None, meta1);
+        network
+            .register("agent-mcp", &["legal translation"], None, meta1)
+            .expect("test registration");
 
         let mut meta2 = HashMap::new();
         meta2.insert("protocol".to_string(), "grpc".to_string());
-        network.register("agent-grpc", &["legal translation"], None, meta2);
+        network
+            .register("agent-grpc", &["legal translation"], None, meta2)
+            .expect("test registration");
 
         let mut meta3 = HashMap::new();
         meta3.insert("protocol".to_string(), "rest".to_string());
-        network.register("agent-rest", &["legal translation"], None, meta3);
+        network
+            .register("agent-rest", &["legal translation"], None, meta3)
+            .expect("test registration");
 
         let mut filters = Filters::new();
         filters.insert(
@@ -1202,11 +1262,15 @@ mod tests {
         let mut network = LocalNetwork::new();
         let mut meta1 = HashMap::new();
         meta1.insert("latency_ms".to_string(), "50".to_string());
-        network.register("fast-agent", &["legal translation"], None, meta1);
+        network
+            .register("fast-agent", &["legal translation"], None, meta1)
+            .expect("test registration");
 
         let mut meta2 = HashMap::new();
         meta2.insert("latency_ms".to_string(), "200".to_string());
-        network.register("slow-agent", &["legal translation"], None, meta2);
+        network
+            .register("slow-agent", &["legal translation"], None, meta2)
+            .expect("test registration");
 
         let mut filters = Filters::new();
         filters.insert("latency_ms".to_string(), FilterValue::LessThan(100.0));
@@ -1219,7 +1283,9 @@ mod tests {
     #[test]
     fn filter_missing_key_fails_strict() {
         let mut network = LocalNetwork::new();
-        network.register("agent-a", &["legal translation"], None, HashMap::new());
+        network
+            .register("agent-a", &["legal translation"], None, HashMap::new())
+            .expect("test registration");
 
         let mut filters = Filters::new();
         filters.insert(
@@ -1240,12 +1306,16 @@ mod tests {
         let mut meta = HashMap::new();
         meta.insert("protocol".to_string(), "mcp".to_string());
         meta.insert("version".to_string(), "2.0".to_string());
-        network.register("agent-match", &["legal translation"], None, meta);
+        network
+            .register("agent-match", &["legal translation"], None, meta)
+            .expect("test registration");
 
         let mut meta2 = HashMap::new();
         meta2.insert("protocol".to_string(), "mcp".to_string());
         meta2.insert("version".to_string(), "1.0".to_string());
-        network.register("agent-old", &["legal translation"], None, meta2);
+        network
+            .register("agent-old", &["legal translation"], None, meta2)
+            .expect("test registration");
 
         let mut filters = Filters::new();
         filters.insert(
@@ -1308,16 +1378,20 @@ mod tests {
         for i in 0..3 {
             let mut meta = HashMap::new();
             meta.insert("protocol".to_string(), "mcp".to_string());
-            network.register(
-                &format!("mcp-agent-{}", i),
-                &["data processing"],
-                None,
-                meta,
-            );
+            network
+                .register(
+                    &format!("mcp-agent-{}", i),
+                    &["data processing"],
+                    None,
+                    meta,
+                )
+                .expect("test registration");
         }
         let mut meta = HashMap::new();
         meta.insert("protocol".to_string(), "rest".to_string());
-        network.register("rest-agent", &["data processing"], None, meta);
+        network
+            .register("rest-agent", &["data processing"], None, meta)
+            .expect("test registration");
 
         let mut filters = Filters::new();
         filters.insert(
@@ -1337,12 +1411,14 @@ mod tests {
         let mut network = LocalNetwork::new();
         let mut meta = HashMap::new();
         meta.insert("protocol".to_string(), "mcp".to_string());
-        network.register(
-            "translate-agent",
-            &["legal translation", "EN-DE"],
-            Some("http://localhost:8080"),
-            meta,
-        );
+        network
+            .register(
+                "translate-agent",
+                &["legal translation", "EN-DE"],
+                Some("http://localhost:8080"),
+                meta,
+            )
+            .expect("test registration");
         reg(&mut network, "summarize-agent", &["document summarization"]);
 
         // Record some feedback
@@ -1474,12 +1550,14 @@ mod tests {
         let mut network = LocalNetwork::new();
         let mut meta = HashMap::new();
         meta.insert("protocol".to_string(), "mcp".to_string());
-        network.register(
-            "translate-agent",
-            &["legal translation"],
-            Some("http://localhost:8080"),
-            meta,
-        );
+        network
+            .register(
+                "translate-agent",
+                &["legal translation"],
+                Some("http://localhost:8080"),
+                meta,
+            )
+            .expect("test registration");
 
         // Add some feedback to verify feedback_factor is populated
         for _ in 0..5 {
@@ -1552,11 +1630,15 @@ mod tests {
         let mut network = LocalNetwork::new();
         let mut meta_mcp = HashMap::new();
         meta_mcp.insert("protocol".to_string(), "mcp".to_string());
-        network.register("agent-mcp", &["legal translation"], None, meta_mcp);
+        network
+            .register("agent-mcp", &["legal translation"], None, meta_mcp)
+            .expect("test registration");
 
         let mut meta_rest = HashMap::new();
         meta_rest.insert("protocol".to_string(), "rest".to_string());
-        network.register("agent-rest", &["legal translation"], None, meta_rest);
+        network
+            .register("agent-rest", &["legal translation"], None, meta_rest)
+            .expect("test registration");
 
         let mut filters = Filters::new();
         filters.insert(
@@ -1615,11 +1697,15 @@ mod tests {
         let mut network = LocalNetwork::new();
         let mut meta_mcp = HashMap::new();
         meta_mcp.insert("protocol".to_string(), "mcp".to_string());
-        network.register("agent-mcp", &["legal translation"], None, meta_mcp);
+        network
+            .register("agent-mcp", &["legal translation"], None, meta_mcp)
+            .expect("test registration");
 
         let mut meta_rest = HashMap::new();
         meta_rest.insert("protocol".to_string(), "rest".to_string());
-        network.register("agent-rest", &["legal translation"], None, meta_rest);
+        network
+            .register("agent-rest", &["legal translation"], None, meta_rest)
+            .expect("test registration");
 
         let mut filters = Filters::new();
         filters.insert(
@@ -1688,9 +1774,13 @@ mod tests {
 
         let mut network = LocalNetwork::with_scorer(Box::new(EqualScorer));
         // agent-fresh: low sigma (novelty favors), low forwards (load-balance favors)
-        network.register("agent-fresh", &["data processing"], None, HashMap::new());
+        network
+            .register("agent-fresh", &["data processing"], None, HashMap::new())
+            .expect("test registration");
         // agent-stale: high sigma, high forwards
-        network.register("agent-stale", &["data processing"], None, HashMap::new());
+        network
+            .register("agent-stale", &["data processing"], None, HashMap::new())
+            .expect("test registration");
 
         // Simulate heavy usage of agent-stale (high sigma, high forwards).
         if let Some(record) = network.agents.get_mut("agent-stale") {
@@ -1773,11 +1863,17 @@ mod tests {
 
         let mut network = LocalNetwork::with_scorer(Box::new(EqualScorer));
         // Agent A: best capability chemistry, but overloaded.
-        network.register("agent-a", &["service A"], None, HashMap::new());
+        network
+            .register("agent-a", &["service A"], None, HashMap::new())
+            .expect("test registration");
         // Agent B: low sigma → novelty picks it.
-        network.register("agent-b", &["service B"], None, HashMap::new());
+        network
+            .register("agent-b", &["service B"], None, HashMap::new())
+            .expect("test registration");
         // Agent C: low forwards → load-balance picks it.
-        network.register("agent-c", &["service C"], None, HashMap::new());
+        network
+            .register("agent-c", &["service C"], None, HashMap::new())
+            .expect("test registration");
 
         // Make agent-a heavily used (high sigma + high forwards).
         if let Some(r) = network.agents.get_mut("agent-a") {
@@ -1840,9 +1936,15 @@ mod tests {
         }
 
         let mut network = LocalNetwork::with_scorer(Box::new(EqualScorer));
-        network.register("agent-a", &["cap"], None, HashMap::new());
-        network.register("agent-b", &["cap"], None, HashMap::new());
-        network.register("agent-c", &["cap"], None, HashMap::new());
+        network
+            .register("agent-a", &["cap"], None, HashMap::new())
+            .expect("test registration");
+        network
+            .register("agent-b", &["cap"], None, HashMap::new())
+            .expect("test registration");
+        network
+            .register("agent-c", &["cap"], None, HashMap::new())
+            .expect("test registration");
 
         // Force extreme divergence in kernel preferences.
         if let Some(r) = network.agents.get_mut("agent-a") {
@@ -1980,8 +2082,12 @@ mod tests {
         }
 
         let mut network = LocalNetwork::with_scorer(Box::new(EqualScorer));
-        network.register("agent-old", &["service"], None, HashMap::new());
-        network.register("agent-new", &["service"], None, HashMap::new());
+        network
+            .register("agent-old", &["service"], None, HashMap::new())
+            .expect("test registration");
+        network
+            .register("agent-new", &["service"], None, HashMap::new())
+            .expect("test registration");
 
         // Give agent-old a big advantage via many successes.
         for _ in 0..50 {
@@ -2492,5 +2598,52 @@ mod tests {
         let network_ref: &LocalNetwork = &network;
         let results = network_ref.discover("legal translation");
         assert!(!results.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Input Validation (Requirement 11)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn register_rejects_empty_agent_name() {
+        use crate::error::DiscoveryError;
+        let mut network = LocalNetwork::new();
+        let result = network.register("", &["capability"], None, HashMap::new());
+        assert!(matches!(result, Err(DiscoveryError::Config(_))));
+        assert!(result.unwrap_err().to_string().contains("empty"));
+    }
+
+    #[test]
+    fn register_rejects_empty_capabilities() {
+        use crate::error::DiscoveryError;
+        let mut network = LocalNetwork::new();
+        let result = network.register("agent", &[], None, HashMap::new());
+        assert!(matches!(result, Err(DiscoveryError::Config(_))));
+        assert!(result.unwrap_err().to_string().contains("Capabilities"));
+    }
+
+    #[test]
+    fn register_rejects_name_exceeding_256_chars() {
+        use crate::error::DiscoveryError;
+        let mut network = LocalNetwork::new();
+        let long_name = "a".repeat(257);
+        let result = network.register(&long_name, &["capability"], None, HashMap::new());
+        assert!(matches!(result, Err(DiscoveryError::Config(_))));
+        assert!(result.unwrap_err().to_string().contains("256"));
+    }
+
+    #[test]
+    fn register_accepts_valid_inputs() {
+        let mut network = LocalNetwork::new();
+        let result = network.register("valid-agent", &["capability"], None, HashMap::new());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn register_accepts_256_char_name() {
+        let mut network = LocalNetwork::new();
+        let max_name = "a".repeat(256);
+        let result = network.register(&max_name, &["capability"], None, HashMap::new());
+        assert!(result.is_ok());
     }
 }

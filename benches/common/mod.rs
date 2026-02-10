@@ -88,7 +88,8 @@ pub fn network_with_agents(n: usize, text_len: TextLength) -> LocalNetwork {
         let agent_name = format!("agent-{}", i);
         let cap = &capabilities[i % capabilities.len()];
         let caps: Vec<&str> = vec![cap.as_str()];
-        net.register(&agent_name, &caps, None, HashMap::new());
+        net.register(&agent_name, &caps, None, HashMap::new())
+            .expect("benchmark registration should succeed");
     }
 
     net

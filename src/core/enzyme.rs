@@ -204,6 +204,30 @@ pub enum Quorum {
     Supermajority(f64),
 }
 
+impl Quorum {
+    /// Create a validated Supermajority quorum.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DiscoveryError::Config` if threshold is not in (0, 1] or is NaN.
+    pub fn supermajority(threshold: f64) -> Result<Self, crate::error::DiscoveryError> {
+        use crate::error::DiscoveryError;
+
+        if threshold.is_nan() {
+            return Err(DiscoveryError::Config(
+                "Supermajority threshold cannot be NaN".to_string(),
+            ));
+        }
+        if threshold <= 0.0 || threshold > 1.0 {
+            return Err(DiscoveryError::Config(format!(
+                "Supermajority threshold must be in (0, 1], got {}",
+                threshold
+            )));
+        }
+        Ok(Quorum::Supermajority(threshold))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SLNEnzymeConfig
 // ---------------------------------------------------------------------------
@@ -1107,5 +1131,51 @@ mod tests {
             }
             other => panic!("Expected Forward or Split, got {:?}", other),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Quorum validation tests (Requirement 11)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn quorum_supermajority_rejects_zero() {
+        use crate::error::DiscoveryError;
+        let result = Quorum::supermajority(0.0);
+        assert!(matches!(result, Err(DiscoveryError::Config(_))));
+    }
+
+    #[test]
+    fn quorum_supermajority_rejects_negative() {
+        use crate::error::DiscoveryError;
+        let result = Quorum::supermajority(-0.5);
+        assert!(matches!(result, Err(DiscoveryError::Config(_))));
+    }
+
+    #[test]
+    fn quorum_supermajority_rejects_above_one() {
+        use crate::error::DiscoveryError;
+        let result = Quorum::supermajority(1.1);
+        assert!(matches!(result, Err(DiscoveryError::Config(_))));
+    }
+
+    #[test]
+    fn quorum_supermajority_rejects_nan() {
+        use crate::error::DiscoveryError;
+        let result = Quorum::supermajority(f64::NAN);
+        assert!(matches!(result, Err(DiscoveryError::Config(_))));
+        assert!(result.unwrap_err().to_string().contains("NaN"));
+    }
+
+    #[test]
+    fn quorum_supermajority_accepts_valid_threshold() {
+        let result = Quorum::supermajority(0.75);
+        assert!(result.is_ok());
+        assert!(matches!(result.unwrap(), Quorum::Supermajority(0.75)));
+    }
+
+    #[test]
+    fn quorum_supermajority_accepts_one() {
+        let result = Quorum::supermajority(1.0);
+        assert!(result.is_ok());
     }
 }
