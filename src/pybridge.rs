@@ -673,17 +673,18 @@ impl PyLocalNetwork {
             .collect();
 
         let (confidence_str, dissenting_kernel, alternative_agents) = match &resp.confidence {
-            crate::network::DiscoveryConfidence::Unanimous => {
+            Some(crate::network::DiscoveryConfidence::Unanimous) => {
                 ("unanimous".to_string(), None, Vec::new())
             }
-            crate::network::DiscoveryConfidence::Majority { dissenting_kernel } => (
+            Some(crate::network::DiscoveryConfidence::Majority { dissenting_kernel }) => (
                 "majority".to_string(),
                 Some(dissenting_kernel.to_string()),
                 Vec::new(),
             ),
-            crate::network::DiscoveryConfidence::Split { alternative_agents } => {
+            Some(crate::network::DiscoveryConfidence::Split { alternative_agents }) => {
                 ("split".to_string(), None, alternative_agents.clone())
             }
+            None => ("none".to_string(), None, Vec::new()),
         };
 
         let py_resp = PyDiscoveryResponse {

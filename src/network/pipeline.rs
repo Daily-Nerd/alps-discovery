@@ -40,6 +40,8 @@ pub struct DiscoveryResult {
     pub endpoint: Option<String>,
     /// Arbitrary metadata (protocol, version, framework, etc.) if provided.
     pub metadata: HashMap<String, String>,
+    /// Per-kernel score breakdown (only populated when explained mode is enabled).
+    pub kernel_scores: Option<HashMap<KernelType, f64>>,
 }
 
 /// Extended discovery result with full scoring breakdown for debugging.
@@ -82,9 +84,12 @@ pub struct DiscoveryResponse {
     /// Ranked discovery results.
     pub results: Vec<DiscoveryResult>,
     /// Kernel agreement confidence level.
-    pub confidence: DiscoveryConfidence,
+    pub confidence: Option<DiscoveryConfidence>,
     /// Recommended number of agents to invoke in parallel.
     pub recommended_parallelism: usize,
+    /// When results are empty, reports the highest similarity score that was
+    /// filtered out (helps distinguish "nothing relevant" from "close but below threshold").
+    pub best_below_threshold: Option<(String, f64)>,
 }
 
 /// Internal scored candidate used by the shared discovery pipeline.
@@ -123,6 +128,7 @@ impl ScoredCandidate {
             score: self.final_score,
             endpoint: self.endpoint,
             metadata: self.metadata,
+            kernel_scores: None, // Not populated in basic mode
         }
     }
 

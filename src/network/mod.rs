@@ -370,8 +370,9 @@ impl LocalNetwork {
             derive_confidence(&kernel_eval, &self.agents, enzyme.config());
         DiscoveryResponse {
             results: candidates.into_iter().map(|c| c.into_result()).collect(),
-            confidence,
+            confidence: Some(confidence),
             recommended_parallelism,
+            best_below_threshold: None, // TODO: implement threshold tracking
         }
     }
 
@@ -449,8 +450,9 @@ impl LocalNetwork {
                 tracing::error!(error = %e, "Query evaluation failed");
                 return DiscoveryResponse {
                     results: Vec::new(),
-                    confidence: DiscoveryConfidence::Unanimous,
+                    confidence: None,
                     recommended_parallelism: 1,
+                    best_below_threshold: None,
                 };
             }
         };
@@ -470,8 +472,9 @@ impl LocalNetwork {
             derive_confidence(&kernel_eval, &self.agents, enzyme.config());
         DiscoveryResponse {
             results: candidates.into_iter().map(|c| c.into_result()).collect(),
-            confidence,
+            confidence: Some(confidence),
             recommended_parallelism,
+            best_below_threshold: None, // TODO: implement threshold tracking
         }
     }
 
@@ -1835,7 +1838,7 @@ mod tests {
         assert!(
             matches!(
                 resp.confidence,
-                DiscoveryConfidence::Unanimous | DiscoveryConfidence::Majority { .. }
+                Some(DiscoveryConfidence::Unanimous) | Some(DiscoveryConfidence::Majority { .. })
             ),
             "confidence should be Unanimous or Majority, got {:?}",
             resp.confidence
@@ -1892,7 +1895,7 @@ mod tests {
         let resp = network.discover_with_confidence("test query");
         // With 3 different kernel preferences, we expect either Split or Majority.
         match &resp.confidence {
-            DiscoveryConfidence::Split { alternative_agents } => {
+            Some(DiscoveryConfidence::Split { alternative_agents }) => {
                 assert!(
                     !alternative_agents.is_empty(),
                     "split should have alternatives"
@@ -1902,7 +1905,7 @@ mod tests {
                     "parallelism should be >= 2 on split"
                 );
             }
-            DiscoveryConfidence::Majority { .. } => {
+            Some(DiscoveryConfidence::Majority { .. }) => {
                 // Also acceptable — two kernels may agree.
                 assert_eq!(resp.recommended_parallelism, 1);
             }
@@ -1910,7 +1913,7 @@ mod tests {
                 // Unanimous is possible if chemistry happens to align.
                 // Just verify it's a valid variant.
                 assert!(
-                    matches!(other, DiscoveryConfidence::Unanimous),
+                    matches!(other, Some(DiscoveryConfidence::Unanimous)),
                     "unexpected confidence: {:?}",
                     other
                 );
@@ -1960,7 +1963,7 @@ mod tests {
 
         let resp = network.discover_with_confidence("test query");
         // If split, parallelism should be > 1.
-        if let DiscoveryConfidence::Split { .. } = &resp.confidence {
+        if let Some(DiscoveryConfidence::Split { .. }) = &resp.confidence {
             assert!(
                 resp.recommended_parallelism > 1,
                 "parallelism should be > 1 on split, got {}",
