@@ -21,16 +21,48 @@ maturin develop
 import alps_discovery as alps
 
 network = alps.LocalNetwork()
-network.register("translate-agent", ["legal translation", "EN-DE", "EN-FR"])
-network.register("summarize-agent", ["document summarization", "legal briefs"])
-network.register("classify-agent", ["document classification", "contract type detection"])
+
+network.register("translate-agent", ["legal translation", "EN-DE", "EN-FR"],
+                  endpoint="http://localhost:8080/translate",
+                  metadata={"protocol": "mcp", "version": "1.0"})
+
+network.register("summarize-agent", ["document summarization", "legal briefs"],
+                  endpoint="http://localhost:9090/summarize")
 
 results = network.discover("translate legal contract")
-for r in results:
-    print(f"{r.agent_name}: similarity={r.similarity:.3f}, score={r.score:.3f}")
-# translate-agent: similarity=0.344, score=0.344
-# summarize-agent: similarity=0.188, score=0.188
-# classify-agent:  similarity=0.094, score=0.094
+best = results[0]
+print(best.agent_name)  # "translate-agent"
+print(best.endpoint)    # "http://localhost:8080/translate"
+print(best.metadata)    # {"protocol": "mcp", "version": "1.0"}
+```
+
+## Using discovery results
+
+ALPS is DNS for agents — it resolves capability queries to endpoints. You invoke agents using your own client:
+
+```python
+results = network.discover("translate legal contract")
+best = results[0]
+
+# Use the endpoint with your existing client
+if best.endpoint:
+    response = mcp_client.call(best.endpoint, {"text": doc, "target": "DE"})
+    network.record_success(best.agent_name)
+```
+
+For local single-process agents, register an optional `invoke` callable:
+
+```python
+def my_translate(request):
+    return {"translated": do_translation(request["text"])}
+
+network.register("local-translator", ["legal translation"],
+                  invoke=my_translate)
+
+results = network.discover("translate legal contract")
+if results[0].invoke:
+    output = results[0].invoke({"text": "Vertragsbedingungen..."})
+    network.record_success(results[0].agent_name)
 ```
 
 ## Feedback loop
@@ -42,7 +74,7 @@ Ranking adapts to real-world outcomes:
 network.record_success("translate-agent")
 
 # Agent failed — reduce its ranking
-network.record_failure("classify-agent")
+network.record_failure("summarize-agent")
 
 # Future queries reflect the feedback
 results = network.discover("translate legal contract")
@@ -54,9 +86,15 @@ results = network.discover("translate legal contract")
 
 Create a new discovery network.
 
-### `.register(name: str, capabilities: list[str])`
+### `.register(name, capabilities, *, endpoint=None, metadata=None, invoke=None)`
 
-Register an agent. Each capability string is converted to a MinHash signature for similarity matching.
+Register an agent.
+
+- `name` — unique agent identifier
+- `capabilities` — list of capability description strings (converted to MinHash signatures)
+- `endpoint` — optional URI/URL for the agent (MCP server, REST API, etc.)
+- `metadata` — optional dict of key-value pairs (protocol, version, framework, etc.)
+- `invoke` — optional callable for local single-process invocation
 
 ### `.deregister(name: str) -> bool`
 
@@ -68,8 +106,11 @@ Find agents matching a query. Returns results sorted by score (best first). Each
 - `agent_name` — the matched agent
 - `similarity` — capability match strength `[0.0, 1.0]`
 - `score` — combined routing score (similarity x diameter, adjusted by feedback)
+- `endpoint` — agent URI/URL if provided at registration, else `None`
+- `metadata` — dict of key-value pairs if provided, else `{}`
+- `invoke` — callable if provided at registration, else `None`
 
-### `.record_success(agent_name: str)` / `.record_failure(agent_name: str)`
+### `.record_success(agent_name)` / `.record_failure(agent_name)`
 
 Update routing state based on interaction outcomes.
 

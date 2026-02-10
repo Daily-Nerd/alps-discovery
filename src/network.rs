@@ -4,7 +4,7 @@
 // No networking, no decay, no membrane — just the routing engine
 // applied to Chemistry-based capability matching.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
 use crate::core::chemistry::Chemistry;
@@ -30,10 +30,20 @@ pub struct DiscoveryResult {
     pub similarity: f64,
     /// Combined routing score (similarity × diameter, plus feedback effects).
     pub score: f64,
+    /// Agent endpoint (URI, URL, module path, etc.) if provided at registration.
+    pub endpoint: Option<String>,
+    /// Arbitrary metadata (protocol, version, framework, etc.) if provided.
+    pub metadata: HashMap<String, String>,
 }
 
-/// Per-agent record: capability strings, per-capability MinHash signatures, and hypha.
-type AgentRecord = (Vec<String>, Vec<[u8; 64]>, Hypha);
+/// Per-agent record stored in the network.
+struct AgentRecord {
+    capabilities: Vec<String>,
+    cap_signatures: Vec<[u8; 64]>,
+    endpoint: Option<String>,
+    metadata: HashMap<String, String>,
+    hypha: Hypha,
+}
 
 /// Local-mode agent discovery network.
 ///
@@ -45,7 +55,7 @@ type AgentRecord = (Vec<String>, Vec<[u8; 64]>, Hypha);
 /// The routing improves over time via `record_success` / `record_failure`
 /// which update the scoring state feeding the kernel scoring.
 pub struct LocalNetwork {
-    /// Registered agents: name → agent record.
+    /// Registered agents keyed by name.
     agents: BTreeMap<String, AgentRecord>,
     /// The multi-kernel reasoning enzyme.
     enzyme: SLNEnzyme,
@@ -86,7 +96,18 @@ impl LocalNetwork {
     }
 
     /// Register an agent with its capabilities.
-    pub fn register(&mut self, name: &str, capabilities: &[&str]) {
+    ///
+    /// Optionally provide an `endpoint` (URI/URL) and `metadata` (key-value
+    /// pairs like protocol, version, framework) that will be returned in
+    /// discovery results. ALPS does not interpret these — they are passed
+    /// through so the caller can invoke the agent using their own client.
+    pub fn register(
+        &mut self,
+        name: &str,
+        capabilities: &[&str],
+        endpoint: Option<&str>,
+        metadata: HashMap<String, String>,
+    ) {
         let hypha_id = Self::name_to_hypha_id(name);
 
         let mut chemistry = Chemistry::default();
@@ -114,11 +135,13 @@ impl LocalNetwork {
 
         self.agents.insert(
             name.to_string(),
-            (
-                capabilities.iter().map(|s| s.to_string()).collect(),
+            AgentRecord {
+                capabilities: capabilities.iter().map(|s| s.to_string()).collect(),
                 cap_signatures,
+                endpoint: endpoint.map(|s| s.to_string()),
+                metadata,
                 hypha,
-            ),
+            },
         );
     }
 
@@ -145,16 +168,19 @@ impl LocalNetwork {
         let mut results: Vec<DiscoveryResult> = self
             .agents
             .iter()
-            .map(|(name, (_, cap_sigs, hypha))| {
-                let sim = cap_sigs
+            .map(|(name, record)| {
+                let sim = record
+                    .cap_signatures
                     .iter()
                     .map(|sig| MinHasher::similarity(sig, &query_sig.minhash))
                     .fold(0.0f64, f64::max);
-                let score = sim * hypha.state.diameter;
+                let score = sim * record.hypha.state.diameter;
                 DiscoveryResult {
                     agent_name: name.clone(),
                     similarity: sim,
                     score,
+                    endpoint: record.endpoint.clone(),
+                    metadata: record.metadata.clone(),
                 }
             })
             .filter(|r| r.similarity > 0.0)
@@ -172,7 +198,7 @@ impl LocalNetwork {
             query_signature: query_sig,
             query_config: QueryConfig::default(),
         });
-        let hyphae: Vec<&Hypha> = self.agents.values().map(|(_, _, h)| h).collect();
+        let hyphae: Vec<&Hypha> = self.agents.values().map(|r| &r.hypha).collect();
         let decision = self
             .enzyme
             .process(&signal, &self.spore, &hyphae, &self.membrane_state);
@@ -184,9 +210,9 @@ impl LocalNetwork {
             _ => vec![],
         };
         for hypha_id in &picked {
-            for (_, _, hypha) in self.agents.values_mut() {
-                if hypha.id == *hypha_id {
-                    hypha.state.forwards_count += 1;
+            for record in self.agents.values_mut() {
+                if record.hypha.id == *hypha_id {
+                    record.hypha.state.forwards_count += 1;
                 }
             }
         }
@@ -196,20 +222,20 @@ impl LocalNetwork {
 
     /// Record a successful interaction with an agent.
     pub fn record_success(&mut self, agent_name: &str) {
-        if let Some((_, _, hypha)) = self.agents.get_mut(agent_name) {
-            hypha.state.tau += 0.05;
-            hypha.state.sigma += 0.01;
-            hypha.state.diameter = (hypha.state.diameter + 0.01).min(1.0);
-            hypha.state.consecutive_pulse_timeouts = 0;
+        if let Some(record) = self.agents.get_mut(agent_name) {
+            record.hypha.state.tau += 0.05;
+            record.hypha.state.sigma += 0.01;
+            record.hypha.state.diameter = (record.hypha.state.diameter + 0.01).min(1.0);
+            record.hypha.state.consecutive_pulse_timeouts = 0;
         }
     }
 
     /// Record a failed interaction with an agent.
     pub fn record_failure(&mut self, agent_name: &str) {
-        if let Some((_, _, hypha)) = self.agents.get_mut(agent_name) {
-            hypha.state.consecutive_pulse_timeouts =
-                hypha.state.consecutive_pulse_timeouts.saturating_add(1);
-            hypha.state.diameter = (hypha.state.diameter - 0.05).max(0.1);
+        if let Some(record) = self.agents.get_mut(agent_name) {
+            record.hypha.state.consecutive_pulse_timeouts =
+                record.hypha.state.consecutive_pulse_timeouts.saturating_add(1);
+            record.hypha.state.diameter = (record.hypha.state.diameter - 0.05).max(0.1);
         }
     }
 
@@ -246,6 +272,11 @@ impl Default for LocalNetwork {
 mod tests {
     use super::*;
 
+    /// Helper: register with no endpoint/metadata.
+    fn reg(network: &mut LocalNetwork, name: &str, caps: &[&str]) {
+        network.register(name, caps, None, HashMap::new());
+    }
+
     #[test]
     fn empty_network_returns_no_results() {
         let mut network = LocalNetwork::new();
@@ -256,7 +287,7 @@ mod tests {
     #[test]
     fn register_and_discover_matches_capability() {
         let mut network = LocalNetwork::new();
-        network.register("translate-agent", &["legal translation", "EN-DE", "EN-FR"]);
+        reg(&mut network, "translate-agent", &["legal translation", "EN-DE", "EN-FR"]);
         let results = network.discover("legal translation");
         assert!(!results.is_empty());
         assert_eq!(results[0].agent_name, "translate-agent");
@@ -266,8 +297,9 @@ mod tests {
     #[test]
     fn discover_ranks_more_similar_agent_higher() {
         let mut network = LocalNetwork::new();
-        network.register("translate-agent", &["legal translation", "EN-DE", "EN-FR"]);
-        network.register(
+        reg(&mut network, "translate-agent", &["legal translation", "EN-DE", "EN-FR"]);
+        reg(
+            &mut network,
             "summarize-agent",
             &["document summarization", "legal briefs"],
         );
@@ -279,7 +311,7 @@ mod tests {
     #[test]
     fn deregister_removes_agent() {
         let mut network = LocalNetwork::new();
-        network.register("agent-a", &["capability-a"]);
+        reg(&mut network, "agent-a", &["capability-a"]);
         assert_eq!(network.agent_count(), 1);
         assert!(network.deregister("agent-a"));
         assert_eq!(network.agent_count(), 0);
@@ -296,8 +328,8 @@ mod tests {
     #[test]
     fn agents_returns_all_names() {
         let mut network = LocalNetwork::new();
-        network.register("agent-a", &["cap-a"]);
-        network.register("agent-b", &["cap-b"]);
+        reg(&mut network, "agent-a", &["cap-a"]);
+        reg(&mut network, "agent-b", &["cap-b"]);
         let names = network.agents();
         assert_eq!(names.len(), 2);
         assert!(names.contains(&"agent-a".to_string()));
@@ -307,8 +339,8 @@ mod tests {
     #[test]
     fn record_success_improves_ranking() {
         let mut network = LocalNetwork::new();
-        network.register("agent-a", &["data processing"]);
-        network.register("agent-b", &["data processing"]);
+        reg(&mut network, "agent-a", &["data processing"]);
+        reg(&mut network, "agent-b", &["data processing"]);
 
         for _ in 0..20 {
             network.record_success("agent-a");
@@ -329,8 +361,8 @@ mod tests {
     #[test]
     fn record_failure_reduces_ranking() {
         let mut network = LocalNetwork::new();
-        network.register("agent-a", &["data processing"]);
-        network.register("agent-b", &["data processing"]);
+        reg(&mut network, "agent-a", &["data processing"]);
+        reg(&mut network, "agent-b", &["data processing"]);
 
         for _ in 0..10 {
             network.record_failure("agent-a");
@@ -351,21 +383,24 @@ mod tests {
     #[test]
     fn multiple_agents_with_overlapping_capabilities() {
         let mut network = LocalNetwork::new();
-        network.register(
+        reg(
+            &mut network,
             "agent-1",
             &[
                 "legal document translation service",
                 "translate contracts and legal briefs",
             ],
         );
-        network.register(
+        reg(
+            &mut network,
             "agent-2",
             &[
                 "medical record translation service",
                 "translate clinical notes",
             ],
         );
-        network.register(
+        reg(
+            &mut network,
             "agent-3",
             &[
                 "legal document summarization service",
@@ -391,5 +426,35 @@ mod tests {
 
         let id3 = LocalNetwork::name_to_hypha_id("other-agent");
         assert_ne!(id1, id3);
+    }
+
+    #[test]
+    fn endpoint_and_metadata_returned_in_results() {
+        let mut network = LocalNetwork::new();
+        let mut meta = HashMap::new();
+        meta.insert("protocol".to_string(), "mcp".to_string());
+        meta.insert("version".to_string(), "1.0".to_string());
+        network.register(
+            "translate-agent",
+            &["legal translation"],
+            Some("http://localhost:8080/translate"),
+            meta,
+        );
+        reg(&mut network, "bare-agent", &["legal translation"]);
+
+        let results = network.discover("legal translation");
+        assert!(results.len() >= 2);
+
+        let translate = results.iter().find(|r| r.agent_name == "translate-agent").unwrap();
+        assert_eq!(
+            translate.endpoint.as_deref(),
+            Some("http://localhost:8080/translate")
+        );
+        assert_eq!(translate.metadata.get("protocol").map(|s| s.as_str()), Some("mcp"));
+        assert_eq!(translate.metadata.get("version").map(|s| s.as_str()), Some("1.0"));
+
+        let bare = results.iter().find(|r| r.agent_name == "bare-agent").unwrap();
+        assert!(bare.endpoint.is_none());
+        assert!(bare.metadata.is_empty());
     }
 }
