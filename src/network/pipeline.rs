@@ -266,7 +266,7 @@ pub fn run_pipeline(
     let raw_scores = match scorer.score(query) {
         Ok(scores) => scores,
         Err(e) => {
-            eprintln!("alps-discovery: scorer.score() error: {}", e);
+            tracing::error!(error = %e, "Scorer failed during query evaluation");
             return (
                 Vec::new(),
                 KernelEvaluation {

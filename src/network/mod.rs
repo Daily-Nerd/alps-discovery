@@ -32,9 +32,24 @@ mod scorer_adapter;
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use crate::core::config::{ExplorationConfig, LshConfig};
+
+/// Helper to safely acquire a mutex lock, recovering from poison.
+///
+/// If the mutex is poisoned, logs a warning via tracing and recovers
+/// the inner value instead of panicking. This allows the system to
+/// continue operating even if a thread panicked while holding the lock.
+fn safe_lock<'a, T>(mutex: &'a Mutex<T>, context: &str) -> MutexGuard<'a, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            tracing::warn!(context = context, "Mutex poisoned, recovering inner value");
+            poisoned.into_inner()
+        }
+    }
+}
 use crate::core::enzyme::SLNEnzymeConfig;
 use crate::scorer::Scorer;
 
@@ -139,7 +154,7 @@ impl LocalNetwork {
     /// Events are recorded for every discovery, feedback, and tick operation.
     /// Use `replay_log()` to access the log for post-hoc analysis.
     pub fn with_replay(self, max_events: usize) -> Self {
-        *self.replay.lock().unwrap() = ReplayLog::new(max_events);
+        *safe_lock(&self.replay, "replay config") = ReplayLog::new(max_events);
         self
     }
 
@@ -159,6 +174,7 @@ impl LocalNetwork {
     /// pairs like protocol, version, framework) that will be returned in
     /// discovery results. ALPS does not interpret these — they are passed
     /// through so the caller can invoke the agent using their own client.
+    #[tracing::instrument(skip(self, metadata), fields(agent_name = name, capability_count = capabilities.len()))]
     pub fn register(
         &mut self,
         name: &str,
@@ -193,6 +209,7 @@ impl LocalNetwork {
     /// Returns a ranked list of all agents with similarity > 0, sorted by
     /// `score = similarity × diameter`. The diameter incorporates feedback
     /// from `record_success` / `record_failure`.
+    #[tracing::instrument(skip(self), fields(query_len = query.len()))]
     pub fn discover(&self, query: &str) -> Vec<DiscoveryResult> {
         self.discover_filtered(query, None)
     }
@@ -220,14 +237,14 @@ impl LocalNetwork {
         let (candidates, _) = run_pipeline(
             &self.agents,
             &self.scorer,
-            &mut self.enzyme.lock().unwrap(),
+            &mut safe_lock(&self.enzyme, "enzyme"),
             query,
             filters,
             epsilon,
         );
         // Record agent scores in replay log.
         {
-            let mut replay = self.replay.lock().unwrap();
+            let mut replay = safe_lock(&self.replay, "replay discover");
             for c in &candidates {
                 replay.record(EventKind::AgentScored {
                     query: query.to_string(),
@@ -256,7 +273,7 @@ impl LocalNetwork {
         let (candidates, _) = run_pipeline(
             &self.agents,
             &self.scorer,
-            &mut self.enzyme.lock().unwrap(),
+            &mut safe_lock(&self.enzyme, "enzyme"),
             query,
             filters,
             epsilon,
@@ -313,7 +330,7 @@ impl LocalNetwork {
         filters: Option<&Filters>,
     ) -> DiscoveryResponse {
         let epsilon = self.current_epsilon();
-        let mut enzyme = self.enzyme.lock().unwrap();
+        let mut enzyme = safe_lock(&self.enzyme, "enzyme discover");
         let (candidates, kernel_eval) = run_pipeline(
             &self.agents,
             &self.scorer,
@@ -348,7 +365,7 @@ impl LocalNetwork {
         let score_map = match query.evaluate(self.scorer.scorer()) {
             Ok(scores) => scores,
             Err(e) => {
-                eprintln!("alps-discovery: query.evaluate() error: {}", e);
+                tracing::error!(error = %e, "Query evaluation failed");
                 return Vec::new();
             }
         };
@@ -357,7 +374,7 @@ impl LocalNetwork {
         let (candidates, _) = run_pipeline_with_scores(
             &self.agents,
             &self.scorer,
-            &mut self.enzyme.lock().unwrap(),
+            &mut safe_lock(&self.enzyme, "enzyme"),
             primary,
             score_map,
             filters,
@@ -375,7 +392,7 @@ impl LocalNetwork {
         let score_map = match query.evaluate(self.scorer.scorer()) {
             Ok(scores) => scores,
             Err(e) => {
-                eprintln!("alps-discovery: query.evaluate() error: {}", e);
+                tracing::error!(error = %e, "Query evaluation failed");
                 return Vec::new();
             }
         };
@@ -384,7 +401,7 @@ impl LocalNetwork {
         let (candidates, _) = run_pipeline_with_scores(
             &self.agents,
             &self.scorer,
-            &mut self.enzyme.lock().unwrap(),
+            &mut safe_lock(&self.enzyme, "enzyme"),
             primary,
             score_map,
             filters,
@@ -402,7 +419,7 @@ impl LocalNetwork {
         let score_map = match query.evaluate(self.scorer.scorer()) {
             Ok(scores) => scores,
             Err(e) => {
-                eprintln!("alps-discovery: query.evaluate() error: {}", e);
+                tracing::error!(error = %e, "Query evaluation failed");
                 return DiscoveryResponse {
                     results: Vec::new(),
                     confidence: DiscoveryConfidence::Unanimous,
@@ -412,7 +429,7 @@ impl LocalNetwork {
         };
         let primary = query.primary_text().unwrap_or("");
         let epsilon = self.current_epsilon();
-        let mut enzyme = self.enzyme.lock().unwrap();
+        let mut enzyme = safe_lock(&self.enzyme, "enzyme discover");
         let (candidates, kernel_eval) = run_pipeline_with_scores(
             &self.agents,
             &self.scorer,
@@ -442,6 +459,7 @@ impl LocalNetwork {
     /// affecting unrelated query types.
     ///
     /// Global diameter adjustment always applies regardless of query.
+    #[tracing::instrument(skip(self), fields(agent_name, query_provided = query.is_some()))]
     pub fn record_success(&mut self, agent_name: &str, query: Option<&str>) {
         registry::record_success(&mut self.agents, &self.scorer.lsh_config, agent_name, query);
         self.total_feedback_count.fetch_add(1, Ordering::Relaxed);
@@ -460,6 +478,7 @@ impl LocalNetwork {
     /// If `query` is provided, stores per-query-type feedback so future
     /// queries similar to this one penalize the agent's ranking — without
     /// affecting unrelated query types.
+    #[tracing::instrument(skip(self), fields(agent_name, query_provided = query.is_some()))]
     pub fn record_failure(&mut self, agent_name: &str, query: Option<&str>) {
         registry::record_failure(&mut self.agents, &self.scorer.lsh_config, agent_name, query);
         self.total_feedback_count.fetch_add(1, Ordering::Relaxed);
@@ -484,9 +503,10 @@ impl LocalNetwork {
     /// Tau decays by 0.5% per tick (floor at TAU_FLOOR), sigma by 1%.
     /// Diameter is not decayed — it represents structural capacity, not
     /// an ephemeral signal.
+    #[tracing::instrument(skip(self))]
     pub fn tick(&mut self) {
         registry::tick(&mut self.agents);
-        self.replay.lock().unwrap().record(EventKind::TickApplied);
+        safe_lock(&self.replay, "replay tick").record(EventKind::TickApplied);
     }
 
     // -----------------------------------------------------------------------
@@ -515,12 +535,12 @@ impl LocalNetwork {
     ///
     /// Only contains events if `with_replay()` was called during construction.
     pub fn with_replay_log<R>(&self, f: impl FnOnce(&ReplayLog) -> R) -> R {
-        f(&self.replay.lock().unwrap())
+        f(&safe_lock(&self.replay, "replay query"))
     }
 
     /// Access the replay log mutably (e.g. for clearing).
     pub fn with_replay_log_mut<R>(&self, f: impl FnOnce(&mut ReplayLog) -> R) -> R {
-        f(&mut self.replay.lock().unwrap())
+        f(&mut safe_lock(&self.replay, "replay mut"))
     }
 
     /// Detect capability drift for all agents.

@@ -36,9 +36,10 @@ impl Scorer for PyScorer {
                 .inner
                 .call_method1(py, "index_capabilities", (agent_id, caps))
             {
-                eprintln!(
-                    "alps-discovery: scorer.index_capabilities() failed for '{}': {}",
-                    agent_id, e
+                tracing::warn!(
+                    agent_id = agent_id,
+                    error = %e,
+                    "Python scorer index_capabilities() failed"
                 );
             }
         });
@@ -47,9 +48,10 @@ impl Scorer for PyScorer {
     fn remove_agent(&mut self, agent_id: &str) {
         Python::attach(|py| {
             if let Err(e) = self.inner.call_method1(py, "remove_agent", (agent_id,)) {
-                eprintln!(
-                    "alps-discovery: scorer.remove_agent() failed for '{}': {}",
-                    agent_id, e
+                tracing::warn!(
+                    agent_id = agent_id,
+                    error = %e,
+                    "Python scorer remove_agent() failed"
                 );
             }
         });

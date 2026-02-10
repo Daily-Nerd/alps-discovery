@@ -6,6 +6,7 @@
 use pyo3::prelude::*;
 
 pub mod core;
+pub mod error;
 pub mod network;
 pub mod pybridge;
 pub mod query;
