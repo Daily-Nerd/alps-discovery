@@ -166,6 +166,9 @@ impl PyLocalNetwork {
     /// scoring breakdown (raw_similarity, diameter, feedback_factor,
     /// final_score) for debugging and understanding routing decisions.
     ///
+    /// When ``with_confidence=True``, returns a DiscoveryResponse with
+    /// results, confidence level, and recommended_parallelism.
+    ///
     /// Args:
     ///     query: Natural-language capability query.
     ///     filters: Optional dict of metadata filters. Values can be:
@@ -175,13 +178,15 @@ impl PyLocalNetwork {
     ///         - ``{"$gt": 1.5}``: numeric greater-than
     ///         - ``{"$contains": "sub"}``: substring containment
     ///     explain: If True, return ExplainedResult with scoring breakdown.
-    #[pyo3(signature = (query, *, filters=None, explain=false))]
+    ///     with_confidence: If True, return DiscoveryResponse with confidence signal.
+    #[pyo3(signature = (query, *, filters=None, explain=false, with_confidence=false))]
     fn discover(
         &mut self,
         py: Python<'_>,
         query: &str,
         filters: Option<HashMap<String, Py<PyAny>>>,
         explain: bool,
+        with_confidence: bool,
     ) -> PyResult<Py<PyAny>> {
         let rust_filters = if let Some(py_filters) = filters {
             let mut f = crate::network::Filters::new();
@@ -203,6 +208,7 @@ impl PyLocalNetwork {
                     agent_name: r.agent_name,
                     raw_similarity: r.raw_similarity,
                     diameter: r.diameter,
+                    enzyme_score: r.enzyme_score,
                     feedback_factor: r.feedback_factor,
                     final_score: r.final_score,
                     endpoint: r.endpoint,
@@ -210,6 +216,49 @@ impl PyLocalNetwork {
                 })
                 .collect();
             Ok(results.into_pyobject(py)?.into_any().unbind())
+        } else if with_confidence {
+            let resp = self
+                .inner
+                .discover_with_confidence_filtered(query, rust_filters.as_ref());
+
+            let stored: Vec<StoredResult> = resp
+                .results
+                .into_iter()
+                .map(|r| {
+                    let invoke = self.invocables.get(&r.agent_name).map(|f| f.clone_ref(py));
+                    StoredResult {
+                        agent_name: r.agent_name,
+                        similarity: r.similarity,
+                        score: r.score,
+                        endpoint: r.endpoint,
+                        metadata: r.metadata,
+                        invoke,
+                    }
+                })
+                .collect();
+
+            let (confidence_str, dissenting_kernel, alternative_agents) = match &resp.confidence {
+                crate::network::DiscoveryConfidence::Unanimous => {
+                    ("unanimous".to_string(), None, Vec::new())
+                }
+                crate::network::DiscoveryConfidence::Majority { dissenting_kernel } => (
+                    "majority".to_string(),
+                    Some(dissenting_kernel.to_string()),
+                    Vec::new(),
+                ),
+                crate::network::DiscoveryConfidence::Split { alternative_agents } => {
+                    ("split".to_string(), None, alternative_agents.clone())
+                }
+            };
+
+            let py_resp = PyDiscoveryResponse {
+                stored_results: stored,
+                confidence: confidence_str,
+                dissenting_kernel,
+                alternative_agents,
+                recommended_parallelism: resp.recommended_parallelism,
+            };
+            Ok(py_resp.into_pyobject(py)?.into_any().unbind())
         } else {
             let results: Vec<PyDiscoveryResult> = self
                 .inner
@@ -273,6 +322,7 @@ impl PyLocalNetwork {
                             agent_name: r.agent_name,
                             raw_similarity: r.raw_similarity,
                             diameter: r.diameter,
+                            enzyme_score: r.enzyme_score,
                             feedback_factor: r.feedback_factor,
                             final_score: r.final_score,
                             endpoint: r.endpoint,
@@ -470,6 +520,8 @@ pub struct PyExplainedResult {
     #[pyo3(get)]
     pub diameter: f64,
     #[pyo3(get)]
+    pub enzyme_score: f64,
+    #[pyo3(get)]
     pub feedback_factor: f64,
     #[pyo3(get)]
     pub final_score: f64,
@@ -483,12 +535,127 @@ pub struct PyExplainedResult {
 impl PyExplainedResult {
     fn __repr__(&self) -> String {
         format!(
-            "ExplainedResult(agent='{}', sim={:.3}, diameter={:.3}, feedback={:.3}, score={:.3})",
+            "ExplainedResult(agent='{}', sim={:.3}, diameter={:.3}, enzyme={:.3}, feedback={:.3}, score={:.3})",
             self.agent_name,
             self.raw_similarity,
             self.diameter,
+            self.enzyme_score,
             self.feedback_factor,
             self.final_score
         )
+    }
+}
+
+/// Internal storage for a discovery result (non-pyclass).
+struct StoredResult {
+    agent_name: String,
+    similarity: f64,
+    score: f64,
+    endpoint: Option<String>,
+    metadata: HashMap<String, String>,
+    invoke: Option<Py<PyAny>>,
+}
+
+impl StoredResult {
+    fn to_py(&self, py: Python<'_>) -> PyDiscoveryResult {
+        PyDiscoveryResult {
+            agent_name: self.agent_name.clone(),
+            similarity: self.similarity,
+            score: self.score,
+            endpoint: self.endpoint.clone(),
+            metadata: self.metadata.clone(),
+            invoke: self.invoke.as_ref().map(|f| f.clone_ref(py)),
+        }
+    }
+}
+
+/// Discovery response with confidence signal.
+///
+/// Supports iteration for backwards compatibility — existing code that
+/// iterates over discover() results still works when with_confidence=True.
+///
+/// Attributes:
+///     results: Ranked list of DiscoveryResult objects.
+///     confidence: "unanimous", "majority", or "split".
+///     dissenting_kernel: Name of the dissenting kernel (majority only).
+///     alternative_agents: Alternative agent names suggested by dissenting kernels (split only).
+///     recommended_parallelism: Suggested number of agents to invoke in parallel.
+#[pyclass(name = "DiscoveryResponse")]
+pub struct PyDiscoveryResponse {
+    stored_results: Vec<StoredResult>,
+    #[pyo3(get)]
+    pub confidence: String,
+    #[pyo3(get)]
+    pub dissenting_kernel: Option<String>,
+    #[pyo3(get)]
+    pub alternative_agents: Vec<String>,
+    #[pyo3(get)]
+    pub recommended_parallelism: usize,
+}
+
+#[pymethods]
+impl PyDiscoveryResponse {
+    /// Get the results as a list of DiscoveryResult objects.
+    #[getter]
+    fn results(&self, py: Python<'_>) -> Vec<PyDiscoveryResult> {
+        self.stored_results.iter().map(|r| r.to_py(py)).collect()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "DiscoveryResponse(results={}, confidence='{}', parallelism={})",
+            self.stored_results.len(),
+            self.confidence,
+            self.recommended_parallelism
+        )
+    }
+
+    fn __len__(&self) -> usize {
+        self.stored_results.len()
+    }
+
+    fn __getitem__(&self, py: Python<'_>, idx: isize) -> PyResult<Py<PyAny>> {
+        let len = self.stored_results.len() as isize;
+        let actual_idx = if idx < 0 { len + idx } else { idx };
+        if actual_idx < 0 || actual_idx >= len {
+            return Err(pyo3::exceptions::PyIndexError::new_err(
+                "index out of range",
+            ));
+        }
+        let result = self.stored_results[actual_idx as usize].to_py(py);
+        Ok(result.into_pyobject(py)?.into_any().unbind())
+    }
+
+    fn __iter__(slf: PyRef<'_, Self>) -> PyResult<Py<PyDiscoveryResponseIter>> {
+        let py = slf.py();
+        let items: Vec<Py<PyAny>> = slf
+            .stored_results
+            .iter()
+            .map(|r| {
+                let result = r.to_py(py);
+                result.into_pyobject(py).unwrap().into_any().unbind()
+            })
+            .collect();
+        let iter = PyDiscoveryResponseIter {
+            inner: items.into_iter(),
+        };
+        Py::new(py, iter)
+    }
+}
+
+/// Iterator for PyDiscoveryResponse.
+#[pyclass]
+pub struct PyDiscoveryResponseIter {
+    inner: std::vec::IntoIter<Py<PyAny>>,
+}
+
+#[pymethods]
+impl PyDiscoveryResponseIter {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&mut self) -> Option<Py<PyAny>> {
+        self.inner.next()
     }
 }

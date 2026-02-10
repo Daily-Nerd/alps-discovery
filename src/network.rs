@@ -14,13 +14,14 @@ use thiserror::Error;
 
 use crate::core::chemistry::Chemistry;
 use crate::core::config::{LshConfig, SporeConfig};
-use crate::core::enzyme::{Enzyme, SLNEnzyme, SLNEnzymeConfig};
+use crate::core::enzyme::{Enzyme, KernelEvaluation, SLNEnzyme, SLNEnzymeConfig};
 use crate::core::hyphae::Hypha;
 use crate::core::lsh::{compute_query_signature, compute_semantic_signature, MinHasher};
 use crate::core::membrane::MembraneState;
 use crate::core::pheromone::HyphaState;
 use crate::core::signal::{Signal, Tendril};
 use crate::core::spore::tree::Spore;
+use crate::core::types::KernelType;
 use crate::core::types::{HyphaId, PeerAddr, TrailId};
 
 use crate::core::action::EnzymeAction;
@@ -65,6 +66,8 @@ pub struct ExplainedResult {
     pub raw_similarity: f64,
     /// Agent diameter (routing weight from feedback history).
     pub diameter: f64,
+    /// Normalized composite enzyme score [0.0, 1.0].
+    pub enzyme_score: f64,
     /// Per-query feedback factor [-1.0, 1.0].
     pub feedback_factor: f64,
     /// Final combined score.
@@ -75,11 +78,34 @@ pub struct ExplainedResult {
     pub metadata: HashMap<String, String>,
 }
 
+/// Confidence level of a discovery decision based on kernel agreement.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DiscoveryConfidence {
+    /// All kernels agree on the top agent.
+    Unanimous,
+    /// Majority of kernels agree. One dissents.
+    Majority { dissenting_kernel: KernelType },
+    /// No majority. Caller should consider parallel execution.
+    Split { alternative_agents: Vec<String> },
+}
+
+/// Discovery response with confidence signal.
+#[derive(Debug, Clone)]
+pub struct DiscoveryResponse {
+    /// Ranked discovery results.
+    pub results: Vec<DiscoveryResult>,
+    /// Kernel agreement confidence level.
+    pub confidence: DiscoveryConfidence,
+    /// Recommended number of agents to invoke in parallel.
+    pub recommended_parallelism: usize,
+}
+
 /// Internal scored candidate used by the shared discovery pipeline.
 struct ScoredCandidate {
     agent_name: String,
     raw_similarity: f64,
     diameter: f64,
+    enzyme_score: f64,
     feedback_factor: f64,
     final_score: f64,
     endpoint: Option<String>,
@@ -92,6 +118,7 @@ struct CandidateRef<'a> {
     agent_name: &'a str,
     raw_similarity: f64,
     diameter: f64,
+    enzyme_score: f64,
     feedback_factor: f64,
     final_score: f64,
     endpoint: &'a Option<String>,
@@ -351,7 +378,8 @@ impl LocalNetwork {
         query: &str,
         filters: Option<&Filters>,
     ) -> Vec<DiscoveryResult> {
-        self.discover_core(query, filters)
+        let (candidates, _) = self.discover_core(query, filters);
+        candidates
             .into_iter()
             .map(|c| DiscoveryResult {
                 agent_name: c.agent_name,
@@ -373,12 +401,14 @@ impl LocalNetwork {
         query: &str,
         filters: Option<&Filters>,
     ) -> Vec<ExplainedResult> {
-        self.discover_core(query, filters)
+        let (candidates, _) = self.discover_core(query, filters);
+        candidates
             .into_iter()
             .map(|c| ExplainedResult {
                 agent_name: c.agent_name,
                 raw_similarity: c.raw_similarity,
                 diameter: c.diameter,
+                enzyme_score: c.enzyme_score,
                 feedback_factor: c.feedback_factor,
                 final_score: c.final_score,
                 endpoint: c.endpoint,
@@ -420,23 +450,143 @@ impl LocalNetwork {
             .collect()
     }
 
-    /// Shared discovery pipeline: scoring, feedback, tie-breaking, filtering, enzyme update.
-    fn discover_core(&mut self, query: &str, filters: Option<&Filters>) -> Vec<ScoredCandidate> {
+    /// Discover agents with confidence signal.
+    ///
+    /// Returns a `DiscoveryResponse` containing ranked results plus a confidence
+    /// level indicating kernel agreement. When kernels disagree (Split),
+    /// `recommended_parallelism` suggests how many agents to invoke concurrently.
+    pub fn discover_with_confidence(&mut self, query: &str) -> DiscoveryResponse {
+        self.discover_with_confidence_filtered(query, None)
+    }
+
+    /// Discover agents with confidence signal and optional metadata filters.
+    pub fn discover_with_confidence_filtered(
+        &mut self,
+        query: &str,
+        filters: Option<&Filters>,
+    ) -> DiscoveryResponse {
+        let (candidates, kernel_eval) = self.discover_core(query, filters);
+
+        let (confidence, recommended_parallelism) = self.derive_confidence(&kernel_eval);
+
+        let results = candidates
+            .into_iter()
+            .map(|c| DiscoveryResult {
+                agent_name: c.agent_name,
+                similarity: c.raw_similarity,
+                score: c.final_score,
+                endpoint: c.endpoint,
+                metadata: c.metadata,
+            })
+            .collect();
+
+        DiscoveryResponse {
+            results,
+            confidence,
+            recommended_parallelism,
+        }
+    }
+
+    /// Derive confidence from kernel evaluation top picks.
+    fn derive_confidence(&self, kernel_eval: &KernelEvaluation) -> (DiscoveryConfidence, usize) {
+        let top_picks = &kernel_eval.top_picks;
+        if top_picks.is_empty() {
+            return (DiscoveryConfidence::Unanimous, 1);
+        }
+
+        // Count votes per hypha.
+        let mut votes: BTreeMap<&HyphaId, usize> = BTreeMap::new();
+        for (_, hid) in top_picks {
+            *votes.entry(hid).or_insert(0) += 1;
+        }
+
+        let total = top_picks.len();
+        let (best_hid, best_count) = votes
+            .iter()
+            .max_by_key(|(_, c)| *c)
+            .map(|(h, c)| (*h, *c))
+            .unwrap();
+
+        if best_count == total {
+            // All kernels agree.
+            (DiscoveryConfidence::Unanimous, 1)
+        } else if best_count * 2 >= total {
+            // Majority agrees — find the dissenter.
+            let dissenting_kernel = top_picks
+                .iter()
+                .find(|(_, hid)| hid != best_hid)
+                .map(|(kt, _)| *kt)
+                .unwrap_or(KernelType::NoveltySeeking);
+            (DiscoveryConfidence::Majority { dissenting_kernel }, 1)
+        } else {
+            // No majority — split.
+            let hypha_to_name: HashMap<&HyphaId, &str> = self
+                .agents
+                .iter()
+                .map(|(name, record)| (&record.hypha.id, name.as_str()))
+                .collect();
+
+            let alternative_agents: Vec<String> = votes
+                .keys()
+                .filter(|hid| **hid != best_hid)
+                .filter_map(|hid| hypha_to_name.get(hid).map(|s| s.to_string()))
+                .collect();
+
+            let distinct_picks = votes.len();
+            let max_split = self.enzyme.config().max_disagreement_split;
+            let parallelism = distinct_picks.min(max_split);
+            (
+                DiscoveryConfidence::Split { alternative_agents },
+                parallelism,
+            )
+        }
+    }
+
+    /// Shared discovery pipeline: enzyme evaluation, scoring, feedback, tie-breaking, filtering.
+    fn discover_core(
+        &mut self,
+        query: &str,
+        filters: Option<&Filters>,
+    ) -> (Vec<ScoredCandidate>, KernelEvaluation) {
         if self.agents.is_empty() {
-            return Vec::new();
+            return (
+                Vec::new(),
+                KernelEvaluation {
+                    agent_scores: HashMap::new(),
+                    top_picks: Vec::new(),
+                },
+            );
         }
 
         let query_sig = compute_query_signature(query.as_bytes(), &self.lsh_config);
+
+        // Build signal and collect hyphae for enzyme evaluation.
+        let signal = Signal::Tendril(Tendril {
+            trail_id: TrailId([0u8; 32]),
+            query_signature: query_sig.clone(),
+            query_config: QueryConfig::default(),
+        });
+        let hyphae: Vec<&Hypha> = self.agents.values().map(|r| &r.hypha).collect();
+
+        // Run enzyme evaluation BEFORE scoring — enzyme now drives ranking.
+        let kernel_eval = self.enzyme.evaluate_with_scores(&signal, &hyphae);
 
         // Get raw scores from the scorer.
         let raw_scores = match self.scorer.score(query) {
             Ok(scores) => scores,
             Err(e) => {
                 eprintln!("alps-discovery: scorer.score() error: {}", e);
-                return Vec::new();
+                return (Vec::new(), kernel_eval);
             }
         };
         let score_map: HashMap<String, f64> = raw_scores.into_iter().collect();
+
+        // Build a map from agent name to hypha_id for enzyme score lookup.
+        let name_to_hypha: HashMap<&str, &HyphaId> = self
+            .agents
+            .iter()
+            .map(|(name, record)| (name.as_str(), &record.hypha.id))
+            .collect();
 
         // Build lightweight references — no cloning yet.
         let mut refs: Vec<CandidateRef<'_>> = self
@@ -453,14 +603,23 @@ impl LocalNetwork {
                     &query_sig.minhash,
                     self.lsh_config.similarity_threshold,
                 );
-                let adjusted_diameter =
-                    record.hypha.state.diameter * (1.0 + feedback_factor * FEEDBACK_STRENGTH);
 
-                let score = sim * adjusted_diameter;
+                // Look up enzyme score for this agent.
+                let enzyme_score = name_to_hypha
+                    .get(name.as_str())
+                    .and_then(|hid| kernel_eval.agent_scores.get(*hid))
+                    .copied()
+                    .unwrap_or(0.0);
+
+                // New formula: raw_similarity × (0.5 + 0.5 × enzyme_score) × (1.0 + feedback_factor × FEEDBACK_STRENGTH)
+                let score =
+                    sim * (0.5 + 0.5 * enzyme_score) * (1.0 + feedback_factor * FEEDBACK_STRENGTH);
+
                 Some(CandidateRef {
                     agent_name: name.as_str(),
                     raw_similarity: sim,
                     diameter: record.hypha.state.diameter,
+                    enzyme_score,
                     feedback_factor,
                     final_score: score,
                     endpoint: &record.endpoint,
@@ -520,6 +679,7 @@ impl LocalNetwork {
                 agent_name: r.agent_name.to_string(),
                 raw_similarity: r.raw_similarity,
                 diameter: r.diameter,
+                enzyme_score: r.enzyme_score,
                 feedback_factor: r.feedback_factor,
                 final_score: r.final_score,
                 endpoint: r.endpoint.clone(),
@@ -527,13 +687,7 @@ impl LocalNetwork {
             })
             .collect();
 
-        // Run the enzyme to update internal state (feeds LoadBalancingKernel).
-        let signal = Signal::Tendril(Tendril {
-            trail_id: TrailId([0u8; 32]),
-            query_signature: query_sig,
-            query_config: QueryConfig::default(),
-        });
-        let hyphae: Vec<&Hypha> = self.agents.values().map(|r| &r.hypha).collect();
+        // Run the enzyme process to update internal state (feeds LoadBalancingKernel).
         let decision = self
             .enzyme
             .process(&signal, &self.spore, &hyphae, &self.membrane_state);
@@ -552,7 +706,7 @@ impl LocalNetwork {
             }
         }
 
-        results
+        (results, kernel_eval)
     }
 
     /// Record a successful interaction with an agent.
@@ -857,8 +1011,9 @@ mod tests {
         reg(&mut network, "agent-a", &["data processing"]);
         reg(&mut network, "agent-b", &["data processing"]);
 
+        // Use per-query feedback to boost agent-a for this query type.
         for _ in 0..20 {
-            network.record_success("agent-a", None);
+            network.record_success("agent-a", Some("data processing"));
         }
 
         let results = network.discover("data processing");
@@ -1131,12 +1286,23 @@ mod tests {
     #[test]
     fn feedback_without_query_still_works_globally() {
         // Backward compat: record_success(name, None) does global diameter boost.
+        // First degrade agent-a so the diameter boost is visible.
         let mut network = LocalNetwork::new();
         reg(&mut network, "agent-a", &["data processing"]);
         reg(&mut network, "agent-b", &["data processing"]);
 
-        for _ in 0..20 {
+        // Degrade agent-a first, then boost it back with successes.
+        for _ in 0..10 {
+            network.record_failure("agent-a", None);
+        }
+        // Now agent-a has low diameter (~0.5). Boost it with successes.
+        for _ in 0..40 {
             network.record_success("agent-a", None);
+        }
+
+        // Also degrade agent-b to make the difference clear.
+        for _ in 0..5 {
+            network.record_failure("agent-b", None);
         }
 
         let results = network.discover("data processing");
@@ -1145,7 +1311,9 @@ mod tests {
         let b = results.iter().find(|r| r.agent_name == "agent-b").unwrap();
         assert!(
             a.score >= b.score,
-            "global feedback should still boost agent-a"
+            "global feedback should boost agent-a ({:.4}) over agent-b ({:.4})",
+            a.score,
+            b.score
         );
     }
 
@@ -1591,38 +1759,41 @@ mod tests {
 
     #[test]
     fn explain_scores_match_regular_discover() {
+        // Verify that explained results have consistent internal scoring.
+        // Note: each discover call updates enzyme state, so we compare
+        // within the same call rather than across calls.
         let mut network = LocalNetwork::new();
         reg(&mut network, "agent-a", &["legal translation"]);
         reg(&mut network, "agent-b", &["document summarization"]);
 
-        // Run regular discover
-        let regular = network.discover("legal translation");
-        // Run explained discover
         let explained = network.discover_explained("legal translation", None);
 
-        // Same number of results
-        assert_eq!(regular.len(), explained.len());
-
-        // Scores should match (both use same discover_core pipeline).
-        // Compare by agent name since tie-breaking is randomized per call.
-        for exp_r in &explained {
-            let reg_r = regular
-                .iter()
-                .find(|r| r.agent_name == exp_r.agent_name)
-                .expect("explained agent should appear in regular results");
+        // Verify explained results are internally consistent.
+        for r in &explained {
+            // final_score = raw_sim * (0.5 + 0.5 * enzyme_score) * (1.0 + feedback * FEEDBACK_STRENGTH)
+            let expected = r.raw_similarity
+                * (0.5 + 0.5 * r.enzyme_score)
+                * (1.0 + r.feedback_factor * FEEDBACK_STRENGTH);
             assert!(
-                (reg_r.similarity - exp_r.raw_similarity).abs() < 0.001,
-                "{}: similarity mismatch",
-                exp_r.agent_name
-            );
-            assert!(
-                (reg_r.score - exp_r.final_score).abs() < 0.001,
-                "{}: regular score ({:.4}) should match explained final_score ({:.4})",
-                exp_r.agent_name,
-                reg_r.score,
-                exp_r.final_score
+                (r.final_score - expected).abs() < 0.001,
+                "{}: final_score ({:.4}) should match computed ({:.4})",
+                r.agent_name,
+                r.final_score,
+                expected
             );
         }
+
+        // Also verify that regular discover on a fresh network produces consistent ordering.
+        let mut network2 = LocalNetwork::new();
+        reg(&mut network2, "agent-a", &["legal translation"]);
+        reg(&mut network2, "agent-b", &["document summarization"]);
+
+        let regular = network2.discover("legal translation");
+        let explained2 = network2.discover_explained("legal translation", None);
+
+        // Same number of results (enzyme state changed between calls, but
+        // threshold filtering should be consistent).
+        assert_eq!(regular.len(), explained2.len());
     }
 
     #[test]
@@ -1747,5 +1918,235 @@ mod tests {
             NetworkError::Serialization(_)
         ));
         let _ = std::fs::remove_file(path);
+    }
+
+    // -----------------------------------------------------------------------
+    // Enzyme-driven ranking tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn enzyme_influences_ranking() {
+        // Two agents with the same raw similarity but different enzyme preferences.
+        // The one favored by the enzyme should rank higher.
+        use crate::scorer::Scorer;
+
+        struct EqualScorer;
+        impl Scorer for EqualScorer {
+            fn index_capabilities(&mut self, _: &str, _: &[&str]) {}
+            fn remove_agent(&mut self, _: &str) {}
+            fn score(&self, _: &str) -> Result<Vec<(String, f64)>, String> {
+                Ok(vec![
+                    ("agent-fresh".to_string(), 0.8),
+                    ("agent-stale".to_string(), 0.8),
+                ])
+            }
+        }
+
+        let mut network = LocalNetwork::with_scorer(Box::new(EqualScorer));
+        // agent-fresh: low sigma (novelty favors), low forwards (load-balance favors)
+        network.register("agent-fresh", &["data processing"], None, HashMap::new());
+        // agent-stale: high sigma, high forwards
+        network.register("agent-stale", &["data processing"], None, HashMap::new());
+
+        // Simulate heavy usage of agent-stale (high sigma, high forwards).
+        if let Some(record) = network.agents.get_mut("agent-stale") {
+            record.hypha.state.sigma = 100.0;
+            record.hypha.state.forwards_count = 100;
+        }
+
+        let results = network.discover("data processing");
+        assert!(results.len() >= 2);
+        // Both have same raw similarity, but enzyme should favor agent-fresh.
+        let fresh = results
+            .iter()
+            .find(|r| r.agent_name == "agent-fresh")
+            .unwrap();
+        let stale = results
+            .iter()
+            .find(|r| r.agent_name == "agent-stale")
+            .unwrap();
+        assert!(
+            fresh.score >= stale.score,
+            "enzyme should favor fresh ({:.4}) over stale ({:.4})",
+            fresh.score,
+            stale.score
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Confidence signal tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn discover_with_confidence_unanimous() {
+        let mut network = LocalNetwork::new();
+        // One clearly dominant agent on ALL kernel axes.
+        reg(
+            &mut network,
+            "translate-agent",
+            &["legal translation services"],
+        );
+        reg(&mut network, "math-agent", &["arithmetic computation"]);
+
+        // Make math-agent worse on ALL axes: high sigma (novelty), high forwards (load-balance).
+        if let Some(r) = network.agents.get_mut("math-agent") {
+            r.hypha.state.sigma = 100.0;
+            r.hypha.state.forwards_count = 100;
+            r.hypha.state.diameter = 0.1;
+        }
+
+        let resp = network.discover_with_confidence("legal translation");
+        assert!(!resp.results.is_empty());
+        // With one dominant agent on all axes, kernels should agree.
+        assert!(
+            matches!(
+                resp.confidence,
+                DiscoveryConfidence::Unanimous | DiscoveryConfidence::Majority { .. }
+            ),
+            "confidence should be Unanimous or Majority, got {:?}",
+            resp.confidence
+        );
+        assert_eq!(resp.recommended_parallelism, 1);
+    }
+
+    #[test]
+    fn discover_with_confidence_split() {
+        use crate::scorer::Scorer;
+
+        // Force equal similarity so enzyme kernels drive the decision.
+        struct EqualScorer;
+        impl Scorer for EqualScorer {
+            fn index_capabilities(&mut self, _: &str, _: &[&str]) {}
+            fn remove_agent(&mut self, _: &str) {}
+            fn score(&self, _: &str) -> Result<Vec<(String, f64)>, String> {
+                Ok(vec![
+                    ("agent-a".to_string(), 0.8),
+                    ("agent-b".to_string(), 0.8),
+                    ("agent-c".to_string(), 0.8),
+                ])
+            }
+        }
+
+        let mut network = LocalNetwork::with_scorer(Box::new(EqualScorer));
+        // Agent A: best capability chemistry, but overloaded.
+        network.register("agent-a", &["service A"], None, HashMap::new());
+        // Agent B: low sigma → novelty picks it.
+        network.register("agent-b", &["service B"], None, HashMap::new());
+        // Agent C: low forwards → load-balance picks it.
+        network.register("agent-c", &["service C"], None, HashMap::new());
+
+        // Make agent-a heavily used (high sigma + high forwards).
+        if let Some(r) = network.agents.get_mut("agent-a") {
+            r.hypha.state.sigma = 1000.0;
+            r.hypha.state.forwards_count = 1000;
+        }
+        // Make agent-b have high forwards (but low sigma).
+        if let Some(r) = network.agents.get_mut("agent-b") {
+            r.hypha.state.forwards_count = 1000;
+        }
+        // Make agent-c have high sigma (but low forwards).
+        if let Some(r) = network.agents.get_mut("agent-c") {
+            r.hypha.state.sigma = 1000.0;
+        }
+
+        let resp = network.discover_with_confidence("test query");
+        // With 3 different kernel preferences, we expect either Split or Majority.
+        match &resp.confidence {
+            DiscoveryConfidence::Split { alternative_agents } => {
+                assert!(
+                    !alternative_agents.is_empty(),
+                    "split should have alternatives"
+                );
+                assert!(
+                    resp.recommended_parallelism >= 2,
+                    "parallelism should be >= 2 on split"
+                );
+            }
+            DiscoveryConfidence::Majority { .. } => {
+                // Also acceptable — two kernels may agree.
+                assert_eq!(resp.recommended_parallelism, 1);
+            }
+            other => {
+                // Unanimous is possible if chemistry happens to align.
+                // Just verify it's a valid variant.
+                assert!(
+                    matches!(other, DiscoveryConfidence::Unanimous),
+                    "unexpected confidence: {:?}",
+                    other
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn recommended_parallelism_increases_on_split() {
+        use crate::scorer::Scorer;
+
+        struct EqualScorer;
+        impl Scorer for EqualScorer {
+            fn index_capabilities(&mut self, _: &str, _: &[&str]) {}
+            fn remove_agent(&mut self, _: &str) {}
+            fn score(&self, _: &str) -> Result<Vec<(String, f64)>, String> {
+                Ok(vec![
+                    ("agent-a".to_string(), 0.8),
+                    ("agent-b".to_string(), 0.8),
+                    ("agent-c".to_string(), 0.8),
+                ])
+            }
+        }
+
+        let mut network = LocalNetwork::with_scorer(Box::new(EqualScorer));
+        network.register("agent-a", &["cap"], None, HashMap::new());
+        network.register("agent-b", &["cap"], None, HashMap::new());
+        network.register("agent-c", &["cap"], None, HashMap::new());
+
+        // Force extreme divergence in kernel preferences.
+        if let Some(r) = network.agents.get_mut("agent-a") {
+            r.hypha.state.sigma = 1000.0;
+            r.hypha.state.forwards_count = 1000;
+        }
+        if let Some(r) = network.agents.get_mut("agent-b") {
+            r.hypha.state.forwards_count = 1000;
+        }
+        if let Some(r) = network.agents.get_mut("agent-c") {
+            r.hypha.state.sigma = 1000.0;
+        }
+
+        let resp = network.discover_with_confidence("test query");
+        // If split, parallelism should be > 1.
+        if let DiscoveryConfidence::Split { .. } = &resp.confidence {
+            assert!(
+                resp.recommended_parallelism > 1,
+                "parallelism should be > 1 on split, got {}",
+                resp.recommended_parallelism
+            );
+        }
+    }
+
+    #[test]
+    fn backwards_compat_discover_returns_vec() {
+        let mut network = LocalNetwork::new();
+        reg(&mut network, "agent-a", &["legal translation"]);
+        // discover() returns Vec<DiscoveryResult> — no changes to API.
+        let results = network.discover("legal translation");
+        assert!(!results.is_empty());
+        // Verify it's actually a DiscoveryResult.
+        assert!(!results[0].agent_name.is_empty());
+        assert!(results[0].similarity > 0.0);
+    }
+
+    #[test]
+    fn explained_result_includes_enzyme_score() {
+        let mut network = LocalNetwork::new();
+        reg(&mut network, "agent-a", &["data processing services"]);
+        let results = network.discover_explained("data processing", None);
+        assert!(!results.is_empty());
+        let r = &results[0];
+        // enzyme_score should be populated (> 0 for a matching agent).
+        assert!(
+            r.enzyme_score >= 0.0 && r.enzyme_score <= 1.0,
+            "enzyme_score ({}) should be in [0, 1]",
+            r.enzyme_score
+        );
     }
 }

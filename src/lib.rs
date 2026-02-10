@@ -16,5 +16,6 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<pybridge::PyLocalNetwork>()?;
     m.add_class::<pybridge::PyDiscoveryResult>()?;
     m.add_class::<pybridge::PyExplainedResult>()?;
+    m.add_class::<pybridge::PyDiscoveryResponse>()?;
     Ok(())
 }

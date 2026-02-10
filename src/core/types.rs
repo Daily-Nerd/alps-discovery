@@ -31,5 +31,15 @@ pub enum KernelType {
     LoadBalancing,
 }
 
+impl std::fmt::Display for KernelType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KernelType::CapabilityMatching => write!(f, "capability_matching"),
+            KernelType::NoveltySeeking => write!(f, "novelty_seeking"),
+            KernelType::LoadBalancing => write!(f, "load_balancing"),
+        }
+    }
+}
+
 // QueryConfig is defined in config.rs and re-exported here for convenience.
 pub use crate::core::config::QueryConfig;

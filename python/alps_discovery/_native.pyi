@@ -1,6 +1,7 @@
 """Type stubs for alps_discovery._native (Rust extension module)."""
 
-from typing import Any
+from collections.abc import Iterator
+from typing import Any, overload
 
 class LocalNetwork:
     """Local agent discovery network using multi-kernel routing.
@@ -41,24 +42,27 @@ class LocalNetwork:
         """Remove an agent. Returns True if found."""
         ...
 
+    @overload
     def discover(
         self,
         query: str,
         *,
         filters: dict[str, Any] | None = None,
         explain: bool = False,
-    ) -> list[DiscoveryResult] | list[ExplainedResult]:
+        with_confidence: bool = False,
+    ) -> list[DiscoveryResult] | list[ExplainedResult] | DiscoveryResponse:
         """Discover agents matching a query.
 
         Args:
             query: Natural-language capability query.
-            filters: Optional metadata filters (applied in both normal and explain
-                mode). String values for exact match, or dicts with $in, $lt,
-                $gt, $contains operators.
+            filters: Optional metadata filters. String values for exact match,
+                or dicts with $in, $lt, $gt, $contains operators.
             explain: If True, returns ExplainedResult with scoring breakdown.
+            with_confidence: If True, returns DiscoveryResponse with confidence signal.
 
         Returns:
-            Ranked list of results, best match first.
+            Ranked list of results (default), ExplainedResult list (explain=True),
+            or DiscoveryResponse (with_confidence=True).
         """
         ...
 
@@ -116,7 +120,7 @@ class DiscoveryResult:
     Attributes:
         agent_name: The matched agent's name.
         similarity: Raw capability similarity [0.0, 1.0].
-        score: Combined routing score (similarity x diameter, adjusted by feedback).
+        score: Combined routing score (similarity x enzyme x feedback).
         endpoint: Agent URI/URL if provided at registration, else None.
         metadata: Dict of key-value pairs if provided, else {}.
         invoke: Callable if provided at registration, else None.
@@ -136,6 +140,7 @@ class ExplainedResult:
         agent_name: The matched agent's name.
         raw_similarity: Raw capability similarity from the scorer [0.0, 1.0].
         diameter: Agent's routing diameter (weight from feedback history).
+        enzyme_score: Normalized composite enzyme score [0.0, 1.0].
         feedback_factor: Per-query feedback adjustment [-1.0, 1.0].
         final_score: Combined routing score.
         endpoint: Agent URI/URL if provided at registration, else None.
@@ -145,7 +150,31 @@ class ExplainedResult:
     agent_name: str
     raw_similarity: float
     diameter: float
+    enzyme_score: float
     feedback_factor: float
     final_score: float
     endpoint: str | None
     metadata: dict[str, str]
+
+class DiscoveryResponse:
+    """Discovery response with confidence signal.
+
+    Supports iteration and indexing for backwards compatibility.
+
+    Attributes:
+        results: Ranked list of DiscoveryResult objects.
+        confidence: "unanimous", "majority", or "split".
+        dissenting_kernel: Name of the dissenting kernel (majority only).
+        alternative_agents: Alternative agent names (split only).
+        recommended_parallelism: Suggested number of agents to invoke in parallel.
+    """
+
+    results: list[DiscoveryResult]
+    confidence: str
+    dissenting_kernel: str | None
+    alternative_agents: list[str]
+    recommended_parallelism: int
+
+    def __len__(self) -> int: ...
+    def __getitem__(self, idx: int) -> DiscoveryResult: ...
+    def __iter__(self) -> Iterator[DiscoveryResult]: ...
