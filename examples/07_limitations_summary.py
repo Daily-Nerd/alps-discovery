@@ -1,7 +1,8 @@
-"""Internal: comprehensive limitations test for planning purposes.
+"""Known limitations of MinHash-based capability matching.
 
-Run this to see every known limitation demonstrated with concrete examples.
-Use this for roadmap planning — not intended as user-facing documentation.
+Run this to see the remaining limitations demonstrated with concrete
+examples. These are inherent to the lexical matching approach — solvable
+by plugging in a custom scorer (e.g. embedding-based).
 """
 
 import alps_discovery as alps
@@ -30,85 +31,70 @@ for query in ["translate document", "localize content", "convert to another lang
         print(f"    {r.agent_name}: sim={r.similarity:.3f}")
     print()
 
-print("  MinHash sees character 3-grams, not meaning.")
-print("  Workaround: use descriptive, overlapping capability strings.")
-print("  Or use capabilities_from_mcp() for MCP servers.")
+print("  MinHash sees character n-grams, not meaning.")
+print("  'convert to another language' has low overlap with 'translation'.")
+print("  Workaround: use descriptive, overlapping capability strings,")
+print("  or plug in an embedding-based scorer (see 12_custom_scorer.py).")
 
 # ---------------------------------------------------------------------------
-section("2. FEEDBACK IS GLOBAL — not per-query-type")
-# ---------------------------------------------------------------------------
-
-network = alps.LocalNetwork()
-network.register("multi-agent", ["translation", "summarization"],
-                  endpoint="http://multi:8000")
-
-for _ in range(10):
-    network.record_success("multi-agent")   # from translation queries
-for _ in range(10):
-    network.record_failure("multi-agent")   # from summarization queries
-
-results = network.discover("summarize a document")
-if results:
-    print(f"  'summarize a document' -> {results[0].agent_name}: score={results[0].score:.3f}")
-print()
-print("  record_success/failure adjusts GLOBAL diameter.")
-print("  Can't distinguish 'good at X' from 'bad at Y'.")
-
-# ---------------------------------------------------------------------------
-section("3. NO CAPABILITY SCHEMA — flat strings only")
+section("2. SHORT STRINGS — limited n-gram surface")
 # ---------------------------------------------------------------------------
 
 network = alps.LocalNetwork()
-network.register("fast-agent", ["translation", "low-latency"],
-                  endpoint="http://fast:8000", metadata={"latency_ms": "50"})
-network.register("quality-agent", ["translation", "high-accuracy"],
-                  endpoint="http://quality:8000", metadata={"accuracy": "0.98"})
+network.register("agent-a", ["NLP"], endpoint="http://a:8000")
+network.register("agent-b", ["natural language processing"],
+                  endpoint="http://b:8000")
 
-results = network.discover("translate with high accuracy")
-print("  Query: 'translate with high accuracy'")
-for r in results:
-    print(f"    {r.agent_name}: sim={r.similarity:.3f}")
-print()
-print("  Metadata is passthrough only — not used in matching.")
-print("  Can't filter by latency < 100ms or accuracy > 0.95.")
+for query in ["NLP", "natural language processing", "text analysis"]:
+    results = network.discover(query)
+    print(f"  '{query}':")
+    for r in results:
+        print(f"    {r.agent_name}: sim={r.similarity:.3f}")
+    print()
 
-# ---------------------------------------------------------------------------
-section("4. IN-MEMORY ONLY — no persistence")
-# ---------------------------------------------------------------------------
-
-print("  LocalNetwork is in-memory. No save()/load().")
-print("  Re-register agents on startup from your own store.")
+print("  Very short strings (e.g. 'NLP') produce few shingles,")
+print("  making similarity unreliable. Use longer, descriptive capabilities.")
 
 # ---------------------------------------------------------------------------
-section("5. DETERMINISTIC TIE-BREAKING — no load balancing for identical agents")
+section("3. ACRONYMS AND ABBREVIATIONS — no expansion")
 # ---------------------------------------------------------------------------
 
 network = alps.LocalNetwork()
-for i in range(5):
-    network.register(f"worker-{i}", ["data processing"],
-                      endpoint=f"http://worker-{i}:8000")
+network.register("ml-agent", ["machine learning model training"],
+                  endpoint="http://ml:8000")
 
-from collections import Counter
-picks = Counter()
-for _ in range(50):
-    results = network.discover("data processing")
-    picks[results[0].agent_name] += 1
+for query in ["ML training", "machine learning", "train a model"]:
+    results = network.discover(query)
+    if results:
+        print(f"  '{query}' -> {results[0].agent_name}: sim={results[0].similarity:.3f}")
+    else:
+        print(f"  '{query}' -> NO MATCHES")
 
-print("  50 queries across 5 identical agents:")
-for agent, count in picks.most_common():
-    print(f"    {agent}: {count}")
 print()
-print("  Same agent wins every time due to deterministic enzyme.")
-print("  Real workloads have different capabilities — this is synthetic.")
+print("  'ML' doesn't match 'machine learning' lexically.")
+print("  Include both forms in capabilities to handle this.")
 
 # ---------------------------------------------------------------------------
-section("SUMMARY")
+section("WHAT'S SOLVED")
 # ---------------------------------------------------------------------------
 
-print("""  What matters now:
-    1. Lexical matching — workaround: descriptive capabilities
-    2. Global feedback — acceptable for v0.1
-    3. No schema filtering — metadata passthrough only
-    4. In-memory — re-register on startup
-    5. Deterministic ties — only for identical agents
+print("""  These former limitations are now addressed:
+
+    - Per-query feedback: record_success/failure accept query= kwarg
+      so feedback only affects similar query types (see 04_feedback_loop.py)
+
+    - Metadata filtering: discover(query, filters={...}) supports
+      $in, $lt, $gt, $contains operators (see 09_metadata_filters.py)
+
+    - Persistence: save()/load() preserves agents, scores, and
+      feedback history across restarts (see 10_persistence.py)
+
+    - Randomized tie-breaking: identical agents are shuffled so
+      traffic distributes naturally (see 06_scale_and_load_balancing.py)
+
+    - Explain mode: discover(query, explain=True) shows full scoring
+      breakdown for debugging (see 11_explain_mode.py)
+
+    - Pluggable scorer: swap MinHash for any scorer (e.g. embeddings)
+      via the scorer= kwarg (see 12_custom_scorer.py)
 """)

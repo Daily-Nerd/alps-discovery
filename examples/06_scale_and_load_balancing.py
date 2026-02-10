@@ -1,8 +1,8 @@
-"""Scale test: many agents, load balancing, and novelty exploration.
+"""Scale test: many agents, randomized tie-breaking, and traffic distribution.
 
-Tests how the SDK handles larger agent pools and whether the
-multi-kernel voting (capability + load balancing + novelty)
-actually distributes traffic or concentrates on one winner.
+Tests how the SDK handles larger agent pools. When multiple agents
+score within 5% of the top score, randomized tie-breaking shuffles
+them so traffic distributes naturally — no external load balancer needed.
 """
 
 import alps_discovery as alps
@@ -37,22 +37,37 @@ for agent, count in first_picks.most_common():
 unique_firsts = len(first_picks)
 print(f"\nUnique first-place agents: {unique_firsts}/20")
 
-if unique_firsts == 1:
-    print("  Note: deterministic tie-breaking means identical agents always")
-    print("  resolve to the same winner. LoadBalancingKernel's forwards_count")
-    print("  signal is outvoted by CapabilityKernel in the majority vote.")
-    print("  For real workloads, agents have different capabilities so this")
-    print("  is rarely a problem.")
+if unique_firsts > 1:
+    print("  Randomized tie-breaking distributes traffic across agents")
+    print("  with similar scores (within 5% of the top score).")
+else:
+    print("  Only one winner — scores may differ enough to prevent ties.")
 
-# Check if novelty kernel has any visible effect
-print("\n=== Novelty effect ===")
-winner_streak = []
-for i in range(10):
+# Show that summarization queries go to different agents
+print("\n=== Summarization queries ===")
+sum_picks = Counter()
+for _ in range(100):
+    results = network.discover("summarize legal brief")
+    if results:
+        sum_picks[results[0].agent_name] += 1
+
+for agent, count in sum_picks.most_common(5):
+    bar = "#" * count
+    print(f"  {agent}: {count:3d} {bar}")
+
+# Show how feedback shifts distribution
+print("\n=== Feedback shifts distribution ===")
+# Boost one specific agent
+for _ in range(20):
+    network.record_success("translate-05", query="translate legal contract")
+
+boosted_picks = Counter()
+for _ in range(100):
     results = network.discover("translate legal contract")
-    winner = results[0].agent_name
-    winner_streak.append(winner)
-    network.record_success(winner)
+    if results:
+        boosted_picks[results[0].agent_name] += 1
 
-unique_in_streak = len(set(winner_streak))
-print(f"Winners over 10 rounds with success feedback: {winner_streak[:5]}...")
-print(f"Unique winners: {unique_in_streak}")
+print("After boosting translate-05 with 20 successes:")
+for agent, count in boosted_picks.most_common(5):
+    bar = "#" * count
+    print(f"  {agent}: {count:3d} {bar}")
