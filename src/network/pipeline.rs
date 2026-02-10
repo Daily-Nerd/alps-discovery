@@ -318,7 +318,7 @@ pub fn run_pipeline_with_scores(
     let signal = Signal::Tendril(Tendril {
         trail_id: TrailId([0u8; 32]),
         query_signature: query_sig.clone(),
-        query_config: QueryConfig::default(),
+        query_config: QueryConfig,
     });
     let hyphae: Vec<&Hypha> = agents.values().map(|r| &r.hypha).collect();
 

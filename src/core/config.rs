@@ -72,20 +72,15 @@ pub enum LshFamily {
 }
 
 /// Query configuration for discovery signals.
+///
+/// Retained for Tendril struct compatibility but currently unused in
+/// local discovery path. May be removed in a future version.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct QueryConfig {
-    /// Alpha parameter for truth bias weighting.
-    pub truth_bias_alpha: f64,
-    /// Similarity threshold for query satisfaction.
-    pub satisfaction_threshold: f64,
-}
+pub struct QueryConfig;
 
 impl Default for QueryConfig {
     fn default() -> Self {
-        Self {
-            truth_bias_alpha: 0.7,
-            satisfaction_threshold: 0.5,
-        }
+        Self
     }
 }
 
@@ -123,19 +118,6 @@ impl ExplorationConfig {
     pub fn current_epsilon(&self, feedback_count: u64) -> f64 {
         let epsilon = self.epsilon_initial * self.epsilon_decay_rate.powf(feedback_count as f64);
         epsilon.clamp(self.epsilon_floor, self.epsilon_initial)
-    }
-}
-
-/// Configuration for the spore (placeholder for enzyme trait signature).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SporeConfig {
-    /// Number of storage rings.
-    pub ring_count: usize,
-}
-
-impl Default for SporeConfig {
-    fn default() -> Self {
-        Self { ring_count: 5 }
     }
 }
 

@@ -14,7 +14,6 @@ use crate::core::types::{DecisionId, HyphaId, KernelType};
 /// The core enzyme trait — sans-IO routing decision interface.
 ///
 /// OSS-simplified: no `&Spore` or `&MembraneState` parameters.
-/// These are proprietary protocol constructs not used in local discovery.
 pub trait Enzyme {
     /// Process a signal and return a routing decision.
     ///
@@ -415,10 +414,10 @@ impl Enzyme for SLNEnzyme {
     ) -> EnzymeDecision {
         let decision_id = self.next_decision_id();
 
-        let action = match signal {
-            Signal::Tendril(_) => self.evaluate_kernels(signal, hyphae, scorer_context),
-            _ => EnzymeAction::Absorb,
-        };
+        // local discovery only handles Tendril signals.
+        // Signal enum now only has Tendril variant.
+        let Signal::Tendril(_) = signal;
+        let action = self.evaluate_kernels(signal, hyphae, scorer_context);
 
         EnzymeDecision {
             action,
@@ -477,7 +476,7 @@ mod tests {
         Signal::Tendril(Tendril {
             trail_id: TrailId([0u8; 32]),
             query_signature: query_sig,
-            query_config: QueryConfig::default(),
+            query_config: QueryConfig,
         })
     }
 
@@ -786,18 +785,6 @@ mod tests {
                 target: h_good.id.clone()
             }
         );
-    }
-
-    #[test]
-    fn sln_enzyme_non_tendril_absorb() {
-        let mut enzyme = SLNEnzyme::with_discovery_kernels(SLNEnzymeConfig::default());
-        let signal = Signal::Nutrient;
-
-        let h = make_hypha(1, 1.0, 0.0, 0, Chemistry::new());
-        let hyphae: Vec<&Hypha> = vec![&h];
-
-        let decision = enzyme.process(&signal, &hyphae, &empty_scorer_context());
-        assert_eq!(decision.action, EnzymeAction::Absorb);
     }
 
     // -----------------------------------------------------------------------

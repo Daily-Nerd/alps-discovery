@@ -4,8 +4,6 @@ pub mod config;
 pub mod enzyme;
 pub mod hyphae;
 pub mod lsh;
-pub mod membrane;
 pub mod pheromone;
 pub mod signal;
-pub mod spore;
 pub mod types;

@@ -22,7 +22,7 @@ fn bench_enzyme_evaluate(c: &mut Criterion) {
         let signal = Signal::Tendril(Tendril {
             trail_id: TrailId([0u8; 32]),
             query_signature: QuerySignature { minhash: [0u8; 64] },
-            query_config: QueryConfig::default(),
+            query_config: QueryConfig,
         });
 
         group.bench_with_input(
@@ -52,7 +52,7 @@ fn bench_enzyme_process(c: &mut Criterion) {
         let signal = Signal::Tendril(Tendril {
             trail_id: TrailId([0u8; 32]),
             query_signature: QuerySignature { minhash: [0u8; 64] },
-            query_config: QueryConfig::default(),
+            query_config: QueryConfig,
         });
 
         group.bench_with_input(
@@ -87,7 +87,7 @@ fn bench_individual_kernels(c: &mut Criterion) {
     let signal = Signal::Tendril(Tendril {
         trail_id: TrailId([0u8; 32]),
         query_signature: QuerySignature { minhash: [0u8; 64] },
-        query_config: QueryConfig::default(),
+        query_config: QueryConfig,
     });
 
     c.bench_function("capability_kernel", |b| {

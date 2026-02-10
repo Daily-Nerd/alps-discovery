@@ -8,20 +8,12 @@ use crate::core::types::TrailId;
 
 /// Signal enum for the discovery routing engine.
 ///
-/// Only Tendril carries data; other variants exist so the enzyme
-/// can handle them (absorb/dissolve) if encountered.
+/// In local discovery SDK, only Tendril is used for
+/// protocol constructs not needed for local agent discovery.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Signal {
     /// Query signal for capability-based discovery.
     Tendril(Tendril),
-    /// Data-carrying signal (not used in local discovery).
-    Nutrient,
-    /// Heartbeat signal (not used in local discovery).
-    Pulse,
-    /// State snapshot signal (not used in local discovery).
-    Spore,
-    /// Abstraction signal (not used in local discovery).
-    Insight,
 }
 
 /// Query signal for capability-based discovery.
