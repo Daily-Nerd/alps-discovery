@@ -37,6 +37,9 @@ pub struct MinHashScorer {
     agents: HashMap<String, Vec<[u8; 64]>>,
     /// LSH configuration (shingle mode, dimensions, threshold).
     config: LshConfig,
+    /// Maximum number of words per capability before truncation (None = unlimited).
+    /// Default: Some(50) to prevent long capability strings from diluting shingle sets.
+    max_tokens: Option<usize>,
 }
 
 impl MinHashScorer {
@@ -45,6 +48,19 @@ impl MinHashScorer {
         Self {
             agents: HashMap::new(),
             config,
+            max_tokens: Some(50), // Default: truncate at 50 words
+        }
+    }
+
+    /// Create a new MinHashScorer with a custom max_tokens limit.
+    ///
+    /// Use this to override the default 50-word truncation limit.
+    /// Pass `None` to disable truncation entirely.
+    pub fn with_max_tokens(max_tokens: usize) -> Self {
+        Self {
+            agents: HashMap::new(),
+            config: LshConfig::default(),
+            max_tokens: Some(max_tokens),
         }
     }
 
@@ -52,19 +68,52 @@ impl MinHashScorer {
     pub fn config(&self) -> &LshConfig {
         &self.config
     }
+
+    /// Truncates a capability string to max_tokens words if needed.
+    ///
+    /// Emits a tracing::warn when truncation occurs with agent name and original token count.
+    fn truncate_capability(&self, agent_id: &str, capability: &str) -> String {
+        let Some(max) = self.max_tokens else {
+            return capability.to_string();
+        };
+
+        let tokens: Vec<&str> = capability.split_whitespace().collect();
+
+        if tokens.len() <= max {
+            return capability.to_string();
+        }
+
+        // Truncation needed
+        tracing::warn!(
+            agent_id = agent_id,
+            original_tokens = tokens.len(),
+            max_tokens = max,
+            "truncating long capability string"
+        );
+
+        tokens[..max].join(" ")
+    }
 }
 
 impl Default for MinHashScorer {
     fn default() -> Self {
-        Self::new(LshConfig::default())
+        Self {
+            agents: HashMap::new(),
+            config: LshConfig::default(),
+            max_tokens: Some(50), // Default: truncate at 50 words
+        }
     }
 }
 
 impl Scorer for MinHashScorer {
     fn index_capabilities(&mut self, agent_id: &str, capabilities: &[&str]) {
+        // Truncate each capability independently before indexing
         let sigs: Vec<[u8; 64]> = capabilities
             .iter()
-            .map(|cap| compute_semantic_signature(cap.as_bytes(), &self.config))
+            .map(|cap| {
+                let truncated = self.truncate_capability(agent_id, cap);
+                compute_semantic_signature(truncated.as_bytes(), &self.config)
+            })
             .collect();
         self.agents.insert(agent_id.to_string(), sigs);
     }
@@ -397,5 +446,90 @@ mod tests {
             "patent-agent ({:.3}) should outscore general-agent ({:.3}) because 'patent' is a rare distinguishing term",
             patent_sim, general_sim
         );
+    }
+
+    // --- Task 6.3: Long capability string truncation tests ---
+
+    #[test]
+    fn minhash_scorer_truncates_long_capabilities() {
+        let mut scorer = MinHashScorer::with_max_tokens(10); // Short limit for testing
+
+        // This capability has 15+ words, should be truncated to 10
+        let long_cap = "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen";
+
+        scorer.index_capabilities("test-agent", &[long_cap]);
+
+        // Should still produce valid signatures
+        let results = scorer.score("one two three").unwrap();
+        assert!(
+            !results.is_empty(),
+            "truncated capability should still match"
+        );
+    }
+
+    #[test]
+    fn minhash_scorer_very_long_capability_still_matches() {
+        // 750-character capability should still produce non-zero similarity
+        let mut scorer = MinHashScorer::default(); // Default max_tokens = 50
+
+        let very_long_cap = "legal translation services for international contracts and documents \
+                             including patent filings trademark applications copyright registrations \
+                             and regulatory compliance documentation across multiple jurisdictions \
+                             with specialized expertise in European Union regulations United States \
+                             federal and state law Asian Pacific trade agreements and Middle Eastern \
+                             commercial law frameworks providing comprehensive linguistic and legal \
+                             analysis for multinational corporations government agencies and non-profit \
+                             organizations requiring accurate culturally appropriate translations that \
+                             preserve legal meaning and technical precision while adhering to local \
+                             regulatory requirements and industry-specific terminology standards for \
+                             pharmaceutical medical device financial services technology transfer and \
+                             intellectual property protection across borders with certified translators \
+                             and legal experts fluent in over forty languages including but not limited \
+                             to English French German Spanish Italian Portuguese Russian Chinese Japanese \
+                             Korean Arabic Hebrew and various regional dialects ensuring compliance with \
+                             international standards such as ISO 17100 and ASTM F2575";
+
+        assert!(
+            very_long_cap.len() > 750,
+            "test capability should be > 750 characters"
+        );
+
+        scorer.index_capabilities("legal-expert", &[very_long_cap]);
+
+        // Should still match related queries
+        let results = scorer.score("legal translation").unwrap();
+        assert!(
+            !results.is_empty(),
+            "750+ character capability should still produce results"
+        );
+        assert!(
+            results[0].1 > 0.0,
+            "similarity should be non-zero for long capability"
+        );
+    }
+
+    #[test]
+    fn minhash_scorer_truncation_preserves_first_tokens() {
+        let mut scorer = MinHashScorer::with_max_tokens(5);
+
+        // Capability with important terms at the beginning
+        scorer.index_capabilities(
+            "agent-a",
+            &["legal translation document services with extra words that will be truncated"],
+        );
+
+        // Should match based on first 5 words
+        let results = scorer.score("legal translation").unwrap();
+        assert!(!results.is_empty());
+
+        // Should NOT match words after truncation point
+        let results_truncated = scorer.score("extra words truncated").unwrap();
+        // May still have some similarity due to common words, but should be low
+        if !results_truncated.is_empty() {
+            assert!(
+                results_truncated[0].1 < results[0].1,
+                "truncated terms should have lower similarity"
+            );
+        }
     }
 }

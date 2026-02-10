@@ -139,6 +139,28 @@ impl MinHasher {
         matching as f64 / SIGNATURE_SIZE as f64
     }
 
+    /// Computes b-bit corrected Jaccard similarity between two signatures.
+    ///
+    /// Accounts for random collision probability introduced by XOR-folding
+    /// 64-bit hashes to 8-bit values. For b=8, A_b = 1/256 ≈ 0.00390625.
+    ///
+    /// Formula: J_corrected = (J_observed - A_b) / (1 - A_b)
+    ///
+    /// This correction removes the upward bias caused by hash collisions,
+    /// making disjoint sets converge toward similarity ≈ 0.0 instead of A_b.
+    pub fn similarity_corrected(a: &[u8; SIGNATURE_SIZE], b: &[u8; SIGNATURE_SIZE]) -> f64 {
+        const B: u32 = 8; // 8-bit signatures (u8)
+        let a_b = 1.0 / (1u64 << B) as f64; // A_b = 1/2^b = 1/256
+
+        let j_observed = Self::similarity(a, b);
+
+        // Apply b-bit correction formula
+        let j_corrected = (j_observed - a_b) / (1.0 - a_b);
+
+        // Clamp to [0.0, 1.0] to handle numerical edge cases
+        j_corrected.clamp(0.0, 1.0)
+    }
+
     /// Computes similarity with a 95% confidence interval.
     ///
     /// MinHash similarity is a binomial estimator: each byte position is an
@@ -159,6 +181,38 @@ impl MinHasher {
             point_estimate: j,
             lower_bound: (j - 1.96 * se).max(0.0),
             upper_bound: (j + 1.96 * se).min(1.0),
+        }
+    }
+
+    /// Computes b-bit corrected similarity with a 95% confidence interval.
+    ///
+    /// Uses the corrected Jaccard estimate and corrected standard error
+    /// formula that accounts for random collisions from XOR-folding.
+    ///
+    /// Corrected SE formula: SE = sqrt(C1 * (1 - C1) / n)
+    /// where C1 = J_corrected + (1 - J_corrected) * A_b
+    ///
+    /// This provides statistically valid confidence intervals for the
+    /// corrected Jaccard similarity estimate.
+    pub fn similarity_with_confidence_corrected(
+        a: &[u8; SIGNATURE_SIZE],
+        b: &[u8; SIGNATURE_SIZE],
+    ) -> ConfidenceInterval {
+        const B: u32 = 8; // 8-bit signatures (u8)
+        let a_b = 1.0 / (1u64 << B) as f64; // A_b = 1/2^b = 1/256
+
+        // Use corrected Jaccard as point estimate
+        let j_corrected = Self::similarity_corrected(a, b);
+
+        // Compute corrected standard error
+        // C1 = J + (1 - J) * A_b (expected matches including random collisions)
+        let c1 = j_corrected + (1.0 - j_corrected) * a_b;
+        let se = (c1 * (1.0 - c1) / SIGNATURE_SIZE as f64).sqrt();
+
+        ConfidenceInterval {
+            point_estimate: j_corrected,
+            lower_bound: (j_corrected - 1.96 * se).max(0.0),
+            upper_bound: (j_corrected + 1.96 * se).min(1.0),
         }
     }
 }
@@ -620,6 +674,163 @@ mod tests {
             avg < 0.2,
             "average similarity of unrelated keys should be low, got {:.3}",
             avg
+        );
+    }
+
+    // --- Task 6.1: B-bit collision correction tests ---
+
+    #[test]
+    fn b_bit_corrected_similarity_for_disjoint_sets() {
+        // Completely disjoint sets should have corrected similarity → 0.0
+        // (uncorrected similarity is biased upward by collision probability A_b = 1/256)
+        let hasher = MinHasher::new(SIGNATURE_SIZE);
+        let s1 = hasher.hash_key(b"quantum physics experiments", &default_mode());
+        let s2 = hasher.hash_key(b"underwater basket weaving", &default_mode());
+
+        let corrected = MinHasher::similarity_corrected(&s1, &s2);
+        let uncorrected = MinHasher::similarity(&s1, &s2);
+
+        // Corrected similarity should be close to 0.0 for disjoint sets
+        assert!(
+            corrected < 0.05,
+            "disjoint sets should have corrected similarity near 0.0, got {:.3}",
+            corrected
+        );
+
+        // Verify correction reduces or maintains similarity (≤) compared to uncorrected
+        // (when uncorrected is very low, correction may clamp both to 0.0)
+        assert!(
+            corrected <= uncorrected,
+            "corrected ({:.3}) should be ≤ uncorrected ({:.3})",
+            corrected,
+            uncorrected
+        );
+    }
+
+    #[test]
+    fn b_bit_correction_formula_applied_correctly() {
+        // Construct signatures with known matching count
+        // to verify the correction formula: J_corrected = (J_observed - A_b) / (1 - A_b)
+        let mut a = [0u8; SIGNATURE_SIZE];
+        let mut b = [0u8; SIGNATURE_SIZE];
+
+        // 10 matching positions out of 64
+        for i in 0..SIGNATURE_SIZE {
+            a[i] = i as u8;
+            b[i] = if i < 10 {
+                i as u8 // Match
+            } else {
+                (i as u8).wrapping_add(128) // Mismatch
+            };
+        }
+
+        let j_observed = 10.0 / 64.0;
+        let a_b = 1.0 / 256.0; // For b=8
+        let expected_corrected = (j_observed - a_b) / (1.0 - a_b);
+
+        let actual_corrected = MinHasher::similarity_corrected(&a, &b);
+
+        assert!(
+            (actual_corrected - expected_corrected).abs() < 1e-10,
+            "correction formula mismatch: got {:.6}, expected {:.6}",
+            actual_corrected,
+            expected_corrected
+        );
+    }
+
+    #[test]
+    fn b_bit_corrected_similarity_identical_inputs_still_one() {
+        let hasher = MinHasher::new(SIGNATURE_SIZE);
+        let sig = hasher.hash_key(b"legal translation services", &default_mode());
+
+        let corrected = MinHasher::similarity_corrected(&sig, &sig);
+
+        assert_eq!(
+            corrected, 1.0,
+            "identical inputs should still have corrected similarity = 1.0"
+        );
+    }
+
+    // --- Task 6.2: Corrected confidence interval tests ---
+
+    #[test]
+    fn b_bit_corrected_confidence_interval_formula() {
+        // Test that corrected CI uses formula: SE = sqrt(C1 * (1 - C1) / n)
+        // where C1 = J + (1 - J) * A_b
+        let mut a = [0u8; SIGNATURE_SIZE];
+        let mut b = [0u8; SIGNATURE_SIZE];
+
+        // 20 matching positions out of 64
+        for i in 0..SIGNATURE_SIZE {
+            a[i] = i as u8;
+            b[i] = if i < 20 {
+                i as u8 // Match
+            } else {
+                (i as u8).wrapping_add(128) // Mismatch
+            };
+        }
+
+        let ci = MinHasher::similarity_with_confidence_corrected(&a, &b);
+
+        // Verify corrected Jaccard is used
+        let j_corrected = MinHasher::similarity_corrected(&a, &b);
+        assert!(
+            (ci.point_estimate - j_corrected).abs() < 1e-10,
+            "CI point estimate should use corrected Jaccard"
+        );
+
+        // Verify corrected SE formula
+        let a_b = 1.0 / 256.0;
+        let c1 = j_corrected + (1.0 - j_corrected) * a_b;
+        let expected_se = (c1 * (1.0 - c1) / SIGNATURE_SIZE as f64).sqrt();
+        let expected_lower = (j_corrected - 1.96 * expected_se).max(0.0);
+        let expected_upper = (j_corrected + 1.96 * expected_se).min(1.0);
+
+        assert!(
+            (ci.lower_bound - expected_lower).abs() < 1e-10,
+            "lower bound should use corrected SE: got {:.6}, expected {:.6}",
+            ci.lower_bound,
+            expected_lower
+        );
+        assert!(
+            (ci.upper_bound - expected_upper).abs() < 1e-10,
+            "upper bound should use corrected SE: got {:.6}, expected {:.6}",
+            ci.upper_bound,
+            expected_upper
+        );
+    }
+
+    #[test]
+    fn b_bit_corrected_ci_bounds_contain_point_estimate() {
+        let hasher = MinHasher::new(SIGNATURE_SIZE);
+        let s1 = hasher.hash_key(b"translate legal document", &default_mode());
+        let s2 = hasher.hash_key(b"legal translation service", &default_mode());
+
+        let ci = MinHasher::similarity_with_confidence_corrected(&s1, &s2);
+
+        assert!(ci.lower_bound <= ci.point_estimate);
+        assert!(ci.point_estimate <= ci.upper_bound);
+        assert!(ci.lower_bound >= 0.0);
+        assert!(ci.upper_bound <= 1.0);
+    }
+
+    #[test]
+    fn b_bit_corrected_ci_identical_inputs_tight_bounds() {
+        let hasher = MinHasher::new(SIGNATURE_SIZE);
+        let sig = hasher.hash_key(b"legal translation services", &default_mode());
+
+        let ci = MinHasher::similarity_with_confidence_corrected(&sig, &sig);
+
+        assert_eq!(ci.point_estimate, 1.0);
+        // For J=1.0, C1 = 1.0 + 0 * A_b = 1.0, SE = sqrt(1.0 * 0.0 / 64) = 0
+        // So bounds should collapse to 1.0
+        assert!(
+            (ci.lower_bound - 1.0).abs() < 1e-10,
+            "lower bound should be ~1.0 for identical inputs"
+        );
+        assert!(
+            (ci.upper_bound - 1.0).abs() < 1e-10,
+            "upper bound should be ~1.0 for identical inputs"
         );
     }
 }
