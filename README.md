@@ -10,7 +10,7 @@ Requires Python 3.11+ and [Rust](https://rustup.rs/).
 
 ```bash
 pip install maturin
-git clone https://github.com/kyvo-org/alps-discovery.git
+git clone https://github.com/Daily-Nerd/alps-discovery.git
 cd alps-discovery
 maturin develop
 ```
