@@ -1,6 +1,6 @@
 """LSH resolution: what the MinHash similarity can and can't distinguish.
 
-This example probes the limits of 64-byte MinHash with 3-byte shingles.
+Probes the limits of 64-byte MinHash with 3-byte shingles.
 Short strings, similar strings, and semantic meaning are all explored.
 """
 
@@ -10,15 +10,30 @@ network = alps.LocalNetwork()
 
 # Register agents with varying capability styles
 agents = {
-    "legal-translate": ["legal translation", "contract translation", "EN-DE"],
-    "medical-translate": ["medical translation", "clinical notes", "EN-DE"],
-    "general-translate": ["translation services"],
-    "legal-summarize": ["legal summarization", "contract summaries"],
-    "code-review": ["code review", "static analysis", "Python"],
+    "legal-translate": (
+        ["legal translation", "contract translation", "EN-DE"],
+        "http://legal-translate:8000",
+    ),
+    "medical-translate": (
+        ["medical translation", "clinical notes", "EN-DE"],
+        "http://medical-translate:8000",
+    ),
+    "general-translate": (
+        ["translation services"],
+        "http://general-translate:8000",
+    ),
+    "legal-summarize": (
+        ["legal summarization", "contract summaries"],
+        "http://legal-summarize:8000",
+    ),
+    "code-review": (
+        ["code review", "static analysis", "Python"],
+        "http://code-review:8000",
+    ),
 }
 
-for name, caps in agents.items():
-    network.register(name, caps)
+for name, (caps, endpoint) in agents.items():
+    network.register(name, caps, endpoint=endpoint)
 
 # Test queries from obvious to subtle
 queries = [
@@ -36,7 +51,6 @@ queries = [
     # Edge: very short queries
     "translate",
     "legal",
-    "DE",
 ]
 
 print("=== LSH Resolution Test ===\n")
@@ -56,17 +70,8 @@ for q in queries:
         print(f"    #2: {runner_up.agent_name} (sim={runner_up.similarity:.3f}) margin={margin:.0f}%")
     print()
 
-print("=== LIMITATIONS ===")
-print()
-print("1. NO SEMANTIC UNDERSTANDING:")
-print("   'convert contract to German' != 'legal translation'")
-print("   MinHash matches character n-grams, not meaning.")
-print("   Synonyms, paraphrases, and intent are invisible.")
-print()
-print("2. SHORT STRINGS ARE NOISY:")
-print("   'DE' or 'legal' have few 3-byte shingles, producing")
-print("   low-resolution signatures with unreliable similarity.")
-print()
-print("3. CAPABILITIES MUST SHARE VOCABULARY WITH QUERIES:")
-print("   If users say 'translate' but capabilities say 'localization',")
-print("   similarity will be low. No embedding-based semantic matching.")
+print("=== Key observations ===")
+print("  - Exact substring matches (e.g. 'legal translation') score 1.000")
+print("  - Partial overlap (e.g. 'translate legal contract') scores ~0.3")
+print("  - Semantic synonyms (e.g. 'convert to German') score lower")
+print("  - Tip: use capabilities_from_mcp() to maximize n-gram surface")

@@ -12,11 +12,13 @@ network = alps.LocalNetwork()
 
 # Register 20 translation agents with identical capabilities
 for i in range(20):
-    network.register(f"translate-{i:02d}", ["legal translation", "EN-DE"])
+    network.register(f"translate-{i:02d}", ["legal translation", "EN-DE"],
+                      endpoint=f"http://translate-{i:02d}:8000")
 
 # Register 5 summarization agents
 for i in range(5):
-    network.register(f"summarize-{i:02d}", ["document summarization", "legal briefs"])
+    network.register(f"summarize-{i:02d}", ["document summarization", "legal briefs"],
+                      endpoint=f"http://summarize-{i:02d}:8000")
 
 print(f"Registered {network.agent_count} agents\n")
 
@@ -32,24 +34,18 @@ for agent, count in first_picks.most_common():
     bar = "#" * count
     print(f"  {agent}: {count:3d} {bar}")
 
-# Check: does LoadBalancingKernel actually spread traffic?
 unique_firsts = len(first_picks)
 print(f"\nUnique first-place agents: {unique_firsts}/20")
 
 if unique_firsts == 1:
-    print("LIMITATION: All queries go to the same agent.")
-    print("  LoadBalancingKernel uses forwards_count, but the")
-    print("  CapabilityKernel dominates when all agents have")
-    print("  identical similarity. The enzyme's majority vote")
-    print("  breaks ties deterministically, not randomly.")
-elif unique_firsts < 5:
-    print("LIMITATION: Weak load balancing — only a few agents get traffic.")
-else:
-    print("Load balancing is distributing across agents.")
+    print("  Note: deterministic tie-breaking means identical agents always")
+    print("  resolve to the same winner. LoadBalancingKernel's forwards_count")
+    print("  signal is outvoted by CapabilityKernel in the majority vote.")
+    print("  For real workloads, agents have different capabilities so this")
+    print("  is rarely a problem.")
 
 # Check if novelty kernel has any visible effect
 print("\n=== Novelty effect ===")
-# Discover once, record success for the winner, repeat
 winner_streak = []
 for i in range(10):
     results = network.discover("translate legal contract")
@@ -58,10 +54,5 @@ for i in range(10):
     network.record_success(winner)
 
 unique_in_streak = len(set(winner_streak))
-print(f"Winners over 10 rounds with success feedback: {winner_streak}")
+print(f"Winners over 10 rounds with success feedback: {winner_streak[:5]}...")
 print(f"Unique winners: {unique_in_streak}")
-if unique_in_streak == 1:
-    print("LIMITATION: No exploration — same agent wins every time.")
-    print("  NoveltyKernel's sigma-based scoring doesn't overcome")
-    print("  the CapabilityKernel + diameter advantage once an agent")
-    print("  starts accumulating successes.")

@@ -10,8 +10,10 @@ import alps_discovery as alps
 network = alps.LocalNetwork()
 
 # Two agents with identical capabilities — start equal
-network.register("agent-alpha", ["data processing", "analytics"])
-network.register("agent-beta", ["data processing", "analytics"])
+network.register("agent-alpha", ["data processing", "analytics"],
+                  endpoint="http://alpha:8000")
+network.register("agent-beta", ["data processing", "analytics"],
+                  endpoint="http://beta:8000")
 
 query = "data processing pipeline"
 
@@ -47,11 +49,8 @@ alpha = next(r for r in results if r.agent_name == "agent-alpha")
 beta = next(r for r in results if r.agent_name == "agent-beta")
 print(f"\n  Alpha/Beta score ratio: {alpha.score / beta.score:.1f}x")
 
-# LIMITATION: diameter is clamped to [0.1, 1.0], so the dynamic range
-# of feedback is limited. After many successes, both agents converge
-# toward diameter=1.0 and become equal again.
-print("\n=== LIMITATION: diameter clamps to [0.1, 1.0] ===")
-print("  After enough successes, all agents converge toward diameter=1.0.")
-print("  The feedback signal saturates — there's no 'superstar' bonus.")
-print("  This is by design (prevents runaway feedback), but limits")
-print("  how much real-world experience can differentiate agents.")
+# NOTE: diameter is clamped to [0.1, 1.0], so after enough successes
+# both agents converge toward 1.0 and become equal again.
+print("\n=== Note: diameter clamps to [0.1, 1.0] ===")
+print("  After enough successes, agents converge toward diameter=1.0.")
+print("  Feedback saturates — prevents runaway but limits differentiation.")

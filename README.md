@@ -65,6 +65,21 @@ if results[0].invoke:
     network.record_success(results[0].agent_name)
 ```
 
+## MCP server integration
+
+Register agents directly from MCP tool definitions — no manual capability transcription:
+
+```python
+import alps_discovery as alps
+
+tools = mcp_client.list_tools()  # MCP tool definitions
+network.register("my-mcp-server", alps.capabilities_from_mcp(tools),
+                  endpoint="http://localhost:3001",
+                  metadata={"protocol": "mcp"})
+```
+
+`capabilities_from_mcp()` extracts tool names, descriptions, and parameter descriptions into capability strings. The richer your tool schemas, the better the matching.
+
 ## Feedback loop
 
 Ranking adapts to real-world outcomes:
@@ -118,6 +133,10 @@ Update routing state based on interaction outcomes.
 
 Inspect registered agents.
 
+### `capabilities_from_mcp(tools: list[dict]) -> list[str]`
+
+Extract capability strings from MCP tool definitions. Flattens tool names, descriptions, and parameter descriptions into strings suitable for `register()`. See [MCP server integration](#mcp-server-integration).
+
 ## How it works
 
 Each agent's capabilities become MinHash signatures (locality-sensitive hashing). Queries are converted to the same signature space. Similarity is the best match across individual capabilities (max per-capability Jaccard estimate).
@@ -128,6 +147,14 @@ Three independent reasoning kernels vote on routing:
 - **NoveltyKernel** — favors less-explored agents for diversity
 
 Success/failure feedback adjusts the agent's diameter (routing weight), creating an adaptive system that learns which agents deliver.
+
+## Current limitations
+
+- **Lexical matching, not semantic.** Similarity is based on character n-grams (MinHash), not meaning. Use descriptive capability strings for best results. Embedding-based matching is planned.
+
+- **In-memory only.** State doesn't persist across restarts. Re-register agents on startup.
+
+- **Single-process.** Network discovery across machines is in development.
 
 ## License
 
