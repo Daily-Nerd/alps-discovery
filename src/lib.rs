@@ -11,6 +11,27 @@ pub mod pybridge;
 pub mod query;
 pub mod scorer;
 
+/// Feature-gated re-export of internal types for benchmarking.
+/// Only compiled when the `bench` feature is enabled.
+#[cfg(feature = "bench")]
+pub mod bench_internals {
+    // Re-export pipeline internals
+    pub use crate::network::pipeline::{
+        compute_feedback_factor, run_pipeline, run_pipeline_with_scores, similarity_to_ci,
+        ScoredCandidate, FEEDBACK_STRENGTH,
+    };
+
+    // Re-export registry internals
+    pub use crate::network::registry::{
+        name_to_hypha_id, record_failure, record_success, register_agent, tick, AgentRecord,
+        FeedbackIndex, FeedbackRecord,
+    };
+
+    // Re-export adapter types
+    pub use crate::network::enzyme_adapter::EnzymeAdapter;
+    pub use crate::network::scorer_adapter::ScorerAdapter;
+}
+
 /// ALPS Discovery — local agent discovery via bio-inspired routing.
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {

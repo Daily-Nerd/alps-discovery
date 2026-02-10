@@ -20,6 +20,34 @@ thiserror = "2"
 [build-dependencies]
 pyo3-build-config = "0.27"
 
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
 [features]
 default = []
 extension-module = ["pyo3/extension-module"]
+bench = []
+
+[[bench]]
+name = "lsh"
+harness = false
+
+[[bench]]
+name = "scoring"
+harness = false
+
+[[bench]]
+name = "enzyme"
+harness = false
+
+[[bench]]
+name = "pipeline"
+harness = false
+
+[[bench]]
+name = "query"
+harness = false
+
+[[bench]]
+name = "persistence"
+harness = false

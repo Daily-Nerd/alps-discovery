@@ -4,12 +4,30 @@
 // No networking, no decay, no membrane — just the routing engine
 // applied to Chemistry-based capability matching.
 
+// Conditionally promote visibility for benchmark access
+#[cfg(feature = "bench")]
+pub mod enzyme_adapter;
+#[cfg(not(feature = "bench"))]
 mod enzyme_adapter;
+
 mod filter;
 mod persistence;
+
+#[cfg(feature = "bench")]
+pub mod pipeline;
+#[cfg(not(feature = "bench"))]
 pub(crate) mod pipeline;
+
+#[cfg(feature = "bench")]
+pub mod registry;
+#[cfg(not(feature = "bench"))]
 pub(crate) mod registry;
+
 pub(crate) mod replay;
+
+#[cfg(feature = "bench")]
+pub mod scorer_adapter;
+#[cfg(not(feature = "bench"))]
 mod scorer_adapter;
 
 use std::collections::{BTreeMap, HashMap};

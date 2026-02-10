@@ -48,6 +48,12 @@ pub struct FeedbackIndex {
 const NUM_BANDS: usize = 16;
 const BAND_WIDTH: usize = 4; // 16 bands × 4 bytes = 64 bytes
 
+impl Default for FeedbackIndex {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FeedbackIndex {
     pub fn new() -> Self {
         Self {

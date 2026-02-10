@@ -9,7 +9,8 @@ use crate::core::hyphae::Hypha;
 use crate::core::signal::Signal;
 
 /// Enzyme decision output.
-pub(crate) struct EnzymeDecision {
+/// Public when module is public (bench feature enabled).
+pub struct EnzymeDecision {
     pub action: EnzymeAction,
 }
 

@@ -88,7 +88,8 @@ pub struct DiscoveryResponse {
 }
 
 /// Internal scored candidate used by the shared discovery pipeline.
-pub(crate) struct ScoredCandidate {
+/// Public for benchmark access when `bench` feature is enabled.
+pub struct ScoredCandidate {
     pub agent_name: String,
     pub raw_similarity: f64,
     pub similarity_ci: ConfidenceInterval,
@@ -142,7 +143,8 @@ impl ScoredCandidate {
 }
 
 /// Compute a 95% confidence interval from a raw similarity point estimate.
-pub(crate) fn similarity_to_ci(sim: f64) -> ConfidenceInterval {
+/// Public for benchmark access when `bench` feature is enabled.
+pub fn similarity_to_ci(sim: f64) -> ConfidenceInterval {
     let se = (sim * (1.0 - sim) / CI_SAMPLE_SIZE).sqrt();
     ConfidenceInterval {
         point_estimate: sim,
@@ -156,7 +158,8 @@ pub(crate) fn similarity_to_ci(sim: f64) -> ConfidenceInterval {
 /// Uses the FeedbackIndex to find near-neighbor feedback records in O(k)
 /// instead of scanning all records in O(n). Returns a value in [-1.0, 1.0]
 /// representing how well this agent has performed on similar queries.
-pub(crate) fn compute_feedback_factor(
+/// Public for benchmark access when `bench` feature is enabled.
+pub fn compute_feedback_factor(
     feedback: &FeedbackIndex,
     query_minhash: &[u8; 64],
     relevance_threshold: f64,
@@ -251,7 +254,8 @@ pub(crate) fn derive_confidence(
 ///
 /// Scores all agents via the scorer, then delegates to `run_pipeline_with_scores`.
 /// `exploration_epsilon` controls the probability of shuffling tied agents (0.0 = pure exploit, 1.0 = always explore).
-pub(crate) fn run_pipeline(
+/// Public for benchmark access when `bench` feature is enabled.
+pub fn run_pipeline(
     agents: &BTreeMap<String, AgentRecord>,
     scorer: &ScorerAdapter,
     enzyme: &mut EnzymeAdapter,
@@ -288,7 +292,8 @@ pub(crate) fn run_pipeline(
 ///
 /// `query_text` is used for the Signal/Tendril construction and feedback matching.
 /// `score_map` provides per-agent similarity scores (from Scorer or Query algebra).
-pub(crate) fn run_pipeline_with_scores(
+/// Public for benchmark access when `bench` feature is enabled.
+pub fn run_pipeline_with_scores(
     agents: &BTreeMap<String, AgentRecord>,
     scorer: &ScorerAdapter,
     enzyme: &mut EnzymeAdapter,
