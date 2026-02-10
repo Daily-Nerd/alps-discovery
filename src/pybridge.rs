@@ -7,12 +7,18 @@ use std::collections::HashMap;
 
 use pyo3::prelude::*;
 
+use crate::core::config::LshConfig;
+use crate::core::enzyme::SLNEnzymeConfig;
 use crate::network::LocalNetwork;
 
 /// Local agent discovery network.
 ///
 /// Creates an in-process routing engine that discovers agents by
 /// capability matching using multi-kernel voting.
+///
+/// Args:
+///     similarity_threshold: Minimum similarity for results (default: 0.1).
+///         Results below this are filtered as noise.
 ///
 /// Example:
 ///     network = LocalNetwork()
@@ -31,10 +37,18 @@ pub struct PyLocalNetwork {
 #[pymethods]
 impl PyLocalNetwork {
     /// Create a new empty LocalNetwork.
+    ///
+    /// Args:
+    ///     similarity_threshold: Minimum similarity to include in results (default: 0.1).
     #[new]
-    fn new() -> Self {
+    #[pyo3(signature = (*, similarity_threshold=None))]
+    fn new(similarity_threshold: Option<f64>) -> Self {
+        let mut lsh_config = LshConfig::default();
+        if let Some(t) = similarity_threshold {
+            lsh_config.similarity_threshold = t;
+        }
         Self {
-            inner: LocalNetwork::new(),
+            inner: LocalNetwork::with_config(SLNEnzymeConfig::default(), lsh_config),
             invocables: HashMap::new(),
         }
     }

@@ -1,19 +1,21 @@
 // ALPS-SLN Protocol — LSH-based Query Signatures and Chemistry Matching
 //
-// Task 3.4: Implements MinHash LSH for set-similarity with configurable
-// dimensions. Generates semantic signatures for Nutrient digests and
-// query signatures for Tendril routing.
+// Implements MinHash LSH for set-similarity with configurable dimensions
+// and shingle modes. Generates semantic signatures for capability matching
+// and query signatures for Tendril routing.
 //
-// Key properties (R3.3):
-// - Similar keys produce query signatures with cosine similarity > 0.7
-// - Unrelated keys produce query signatures with cosine similarity < 0.3 (in expectation)
+// Key properties:
+// - Similar keys produce query signatures with high Jaccard similarity
+// - Unrelated keys produce query signatures with low similarity
+// - Hybrid shingling (word + character n-grams) improves matching on
+//   short natural language capability strings
 //
-// Chemistry matching (R18.5):
+// Chemistry matching:
 // - Chemistry deposit uses element-wise minimum to preserve MinHash union property
 // - Similarity = matching positions / total positions (Jaccard estimate)
 
 use crate::core::chemistry::QuerySignature;
-use crate::core::config::{LshConfig, LshFamily};
+use crate::core::config::{LshConfig, LshFamily, ShingleMode};
 
 /// Number of bytes in a MinHash signature (matches Chemistry/QuerySignature size).
 pub const SIGNATURE_SIZE: usize = 64;
@@ -47,36 +49,32 @@ impl MinHasher {
         Self { seeds }
     }
 
-    /// Generates a MinHash signature from a byte key.
+    /// Generates a MinHash signature from a byte key using the specified shingle mode.
     ///
-    /// The key is treated as a set of overlapping shingles (n-grams).
     /// For each hash function, the minimum hash value across all shingles
     /// is retained, producing a signature where similar sets of shingles
     /// yield similar minimum hash values.
     ///
     /// Returns a `SIGNATURE_SIZE`-byte array suitable for use as a
     /// `semantic_signature` in a Digest or as a `QuerySignature`.
-    pub fn hash_key(&self, key: &[u8]) -> [u8; SIGNATURE_SIZE] {
+    pub fn hash_key(&self, key: &[u8], mode: &ShingleMode) -> [u8; SIGNATURE_SIZE] {
+        // Lowercase the input for case-insensitive matching.
+        let lowered: Vec<u8> = key.iter().map(|b| b.to_ascii_lowercase()).collect();
+        let key = &lowered;
+
         let mut signature = [0u8; SIGNATURE_SIZE];
         let num_hashes = self.seeds.len().min(SIGNATURE_SIZE);
 
-        // Generate shingles from the key (overlapping 3-byte windows).
-        // For keys shorter than 3 bytes, use the entire key as a single shingle.
-        let shingle_size = 3;
-
         for (i, &seed) in self.seeds.iter().take(num_hashes).enumerate() {
-            let mut min_hash = u64::MAX;
-
-            if key.len() < shingle_size {
-                // Short key: hash the entire key as one shingle
-                min_hash = xxhash_with_seed(key, seed);
-            } else {
-                // Hash each shingle and keep the minimum
-                for window in key.windows(shingle_size) {
-                    let h = xxhash_with_seed(window, seed);
-                    min_hash = min_hash.min(h);
+            let min_hash = match mode {
+                ShingleMode::Bytes(size) => self.min_hash_bytes(key, *size, seed),
+                ShingleMode::Words => self.min_hash_words(key, seed),
+                ShingleMode::Hybrid { byte_width } => {
+                    let byte_min = self.min_hash_bytes(key, *byte_width, seed);
+                    let word_min = self.min_hash_words(key, seed);
+                    byte_min.min(word_min)
                 }
-            }
+            };
 
             // Map the 64-bit min hash to a single byte via XOR-folding.
             // XOR-folding all 8 bytes together produces much better distribution
@@ -95,6 +93,41 @@ impl MinHasher {
         }
 
         signature
+    }
+
+    /// Compute min hash across byte n-gram shingles.
+    fn min_hash_bytes(&self, key: &[u8], shingle_size: usize, seed: u64) -> u64 {
+        let mut min_hash = u64::MAX;
+        if key.len() < shingle_size {
+            // Short key: hash the entire key as one shingle
+            min_hash = xxhash_with_seed(key, seed);
+        } else {
+            for window in key.windows(shingle_size) {
+                let h = xxhash_with_seed(window, seed);
+                min_hash = min_hash.min(h);
+            }
+        }
+        min_hash
+    }
+
+    /// Compute min hash across word-level shingles (unigrams).
+    /// Splits on whitespace, underscore, hyphen, period, comma.
+    fn min_hash_words(&self, key: &[u8], seed: u64) -> u64 {
+        let mut min_hash = u64::MAX;
+        let mut found_word = false;
+        for word in key.split(|&b| {
+            b == b' ' || b == b'_' || b == b'-' || b == b'.' || b == b',' || b == b'\t'
+        }) {
+            if !word.is_empty() {
+                let h = xxhash_with_seed(word, seed);
+                min_hash = min_hash.min(h);
+                found_word = true;
+            }
+        }
+        if !found_word {
+            return xxhash_with_seed(key, seed);
+        }
+        min_hash
     }
 
     /// Computes the estimated Jaccard similarity between two signatures.
@@ -134,7 +167,7 @@ fn compute_signature(key: &[u8], config: &LshConfig) -> [u8; SIGNATURE_SIZE] {
     match config.family {
         LshFamily::MinHash => {
             let hasher = MinHasher::new(config.dimensions);
-            hasher.hash_key(key)
+            hasher.hash_key(key, &config.shingle_mode)
         }
         LshFamily::RandomProjection => {
             // RandomProjection treats the key as a numeric vector and projects
@@ -206,4 +239,212 @@ fn fold_hash_to_byte(hash: u64) -> u8 {
 /// Uses xxhash-rust's XXH3 64-bit variant for fast, high-quality hashing.
 fn xxhash_with_seed(data: &[u8], seed: u64) -> u64 {
     xxhash_rust::xxh3::xxh3_64_with_seed(data, seed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::config::LshConfig;
+
+    fn default_mode() -> ShingleMode {
+        ShingleMode::Hybrid { byte_width: 3 }
+    }
+
+    #[test]
+    fn signature_is_deterministic() {
+        let hasher = MinHasher::new(128);
+        let s1 = hasher.hash_key(b"legal translation services", &default_mode());
+        let s2 = hasher.hash_key(b"legal translation services", &default_mode());
+        assert_eq!(s1, s2);
+    }
+
+    #[test]
+    fn different_inputs_produce_different_signatures() {
+        let hasher = MinHasher::new(128);
+        let s1 = hasher.hash_key(b"legal translation", &default_mode());
+        let s2 = hasher.hash_key(b"code review", &default_mode());
+        assert_ne!(s1, s2);
+    }
+
+    #[test]
+    fn identical_inputs_have_perfect_similarity() {
+        let hasher = MinHasher::new(128);
+        let sig = hasher.hash_key(b"legal translation services", &default_mode());
+        assert_eq!(MinHasher::similarity(&sig, &sig), 1.0);
+    }
+
+    #[test]
+    fn disjoint_inputs_have_low_similarity() {
+        let hasher = MinHasher::new(128);
+        let s1 = hasher.hash_key(b"legal translation services", &default_mode());
+        let s2 = hasher.hash_key(b"quantum physics experiments", &default_mode());
+        let sim = MinHasher::similarity(&s1, &s2);
+        assert!(
+            sim < 0.25,
+            "disjoint inputs should have low similarity, got {:.3}",
+            sim
+        );
+    }
+
+    #[test]
+    fn similar_inputs_rank_higher_than_dissimilar() {
+        let hasher = MinHasher::new(128);
+        let query = hasher.hash_key(b"translate legal document", &default_mode());
+        let similar = hasher.hash_key(b"legal translation service", &default_mode());
+        let dissimilar = hasher.hash_key(b"image processing pipeline", &default_mode());
+
+        let sim_score = MinHasher::similarity(&query, &similar);
+        let dis_score = MinHasher::similarity(&query, &dissimilar);
+        assert!(
+            sim_score > dis_score,
+            "similar ({:.3}) should exceed dissimilar ({:.3})",
+            sim_score,
+            dis_score
+        );
+    }
+
+    #[test]
+    fn short_key_handling() {
+        let hasher = MinHasher::new(128);
+        // Keys shorter than shingle size should not panic
+        let s1 = hasher.hash_key(b"ab", &default_mode());
+        let s2 = hasher.hash_key(b"a", &default_mode());
+        let s3 = hasher.hash_key(b"", &default_mode());
+        // They should produce valid signatures
+        assert_eq!(s1.len(), SIGNATURE_SIZE);
+        assert_eq!(s2.len(), SIGNATURE_SIZE);
+        assert_eq!(s3.len(), SIGNATURE_SIZE);
+    }
+
+    #[test]
+    fn case_insensitive_matching() {
+        let hasher = MinHasher::new(128);
+        let s1 = hasher.hash_key(b"Translate Legal Contract", &default_mode());
+        let s2 = hasher.hash_key(b"translate legal contract", &default_mode());
+        assert_eq!(
+            MinHasher::similarity(&s1, &s2),
+            1.0,
+            "case should not affect matching"
+        );
+    }
+
+    #[test]
+    fn word_mode_matches_shared_words() {
+        let hasher = MinHasher::new(128);
+        let mode = ShingleMode::Words;
+        // These share "translate" and "legal"
+        let s1 = hasher.hash_key(b"translate legal contract", &mode);
+        let s2 = hasher.hash_key(b"translate legal documents with expertise", &mode);
+        let sim = MinHasher::similarity(&s1, &s2);
+        assert!(
+            sim > 0.1,
+            "shared words should produce meaningful similarity, got {:.3}",
+            sim
+        );
+    }
+
+    #[test]
+    fn hybrid_mode_beats_bytes_only_for_natural_language() {
+        let hasher = MinHasher::new(128);
+        let query = hasher.hash_key(b"translate legal contract", &default_mode());
+        let cap = hasher.hash_key(
+            b"translate text between languages with legal expertise",
+            &default_mode(),
+        );
+        let hybrid_sim = MinHasher::similarity(&query, &cap);
+
+        let bytes_mode = ShingleMode::Bytes(3);
+        let query_b = hasher.hash_key(b"translate legal contract", &bytes_mode);
+        let cap_b = hasher.hash_key(
+            b"translate text between languages with legal expertise",
+            &bytes_mode,
+        );
+        let bytes_sim = MinHasher::similarity(&query_b, &cap_b);
+
+        assert!(
+            hybrid_sim >= bytes_sim,
+            "hybrid ({:.3}) should be >= bytes-only ({:.3})",
+            hybrid_sim,
+            bytes_sim
+        );
+    }
+
+    #[test]
+    fn compute_signature_uses_config() {
+        let config = LshConfig::default();
+        let s1 = compute_signature(b"test key", &config);
+        let s2 = compute_signature(b"test key", &config);
+        assert_eq!(s1, s2, "same config should produce same signature");
+    }
+
+    #[test]
+    fn query_and_semantic_signatures_match() {
+        let config = LshConfig::default();
+        let qs = compute_query_signature(b"test key", &config);
+        let ss = compute_semantic_signature(b"test key", &config);
+        assert_eq!(qs.minhash, ss, "query and semantic signatures should match for same key");
+    }
+
+    #[test]
+    fn wildcard_signature_is_all_0xff() {
+        let ws = wildcard_signature();
+        assert!(ws.minhash.iter().all(|&b| b == 0xFF));
+    }
+
+    #[test]
+    fn similarity_range_is_valid() {
+        let hasher = MinHasher::new(128);
+        let inputs = [
+            b"legal translation".as_slice(),
+            b"code review".as_slice(),
+            b"data processing".as_slice(),
+            b"summarize document".as_slice(),
+        ];
+        for a in &inputs {
+            for b in &inputs {
+                let sa = hasher.hash_key(a, &default_mode());
+                let sb = hasher.hash_key(b, &default_mode());
+                let sim = MinHasher::similarity(&sa, &sb);
+                assert!(
+                    (0.0..=1.0).contains(&sim),
+                    "similarity should be in [0,1], got {}",
+                    sim
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn statistical_unrelated_keys_low_average() {
+        let hasher = MinHasher::new(128);
+        let keys: Vec<&[u8]> = vec![
+            b"legal translation services",
+            b"quantum physics experiments",
+            b"underwater basket weaving",
+            b"cryptocurrency mining hardware",
+            b"organic chemistry formulas",
+            b"satellite orbit calculations",
+            b"medieval history research",
+            b"deep sea exploration vessels",
+            b"volcanic eruption prediction",
+            b"arctic wildlife conservation",
+        ];
+
+        let mut total_sim = 0.0;
+        let mut count = 0;
+        for i in 0..keys.len() {
+            for j in (i + 1)..keys.len() {
+                let sa = hasher.hash_key(keys[i], &default_mode());
+                let sb = hasher.hash_key(keys[j], &default_mode());
+                total_sim += MinHasher::similarity(&sa, &sb);
+                count += 1;
+            }
+        }
+        let avg = total_sim / count as f64;
+        assert!(
+            avg < 0.2,
+            "average similarity of unrelated keys should be low, got {:.3}",
+            avg
+        );
+    }
 }

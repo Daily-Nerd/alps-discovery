@@ -4,10 +4,28 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Controls how input text is decomposed into shingles for MinHash.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShingleMode {
+    /// Character n-grams of the specified byte width.
+    Bytes(usize),
+    /// Word-level tokens (split on whitespace, underscore, hyphen).
+    /// Better for natural language queries.
+    Words,
+    /// Both byte shingles AND word shingles combined.
+    /// A word match OR a character n-gram match can contribute.
+    /// Best recall for short natural language capability strings.
+    Hybrid {
+        /// Byte n-gram width (typically 3).
+        byte_width: usize,
+    },
+}
+
 /// Configuration for the LSH (Locality-Sensitive Hashing) subsystem.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LshConfig {
-    /// Similarity threshold for considering a match.
+    /// Minimum similarity for a discovery result to be returned (default: 0.1).
+    /// Results below this threshold are filtered as noise.
     pub similarity_threshold: f64,
     /// Dissimilarity threshold for considering a non-match.
     pub dissimilarity_threshold: f64,
@@ -15,15 +33,18 @@ pub struct LshConfig {
     pub dimensions: usize,
     /// LSH family selection (default: MinHash for set-similarity).
     pub family: LshFamily,
+    /// How to decompose input text into shingles (default: Hybrid with 3-byte n-grams).
+    pub shingle_mode: ShingleMode,
 }
 
 impl Default for LshConfig {
     fn default() -> Self {
         Self {
-            similarity_threshold: 0.7,
+            similarity_threshold: 0.1,
             dissimilarity_threshold: 0.3,
             dimensions: 128,
             family: LshFamily::MinHash,
+            shingle_mode: ShingleMode::Hybrid { byte_width: 3 },
         }
     }
 }

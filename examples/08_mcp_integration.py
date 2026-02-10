@@ -1,8 +1,9 @@
 """MCP integration: register agents from MCP tool definitions.
 
 Instead of manually writing capability strings, extract them
-from your MCP server's tool schemas. This bridges the gap between
-"my server has rich JSON tool definitions" and "alps wants strings."
+from your MCP server's tool schemas. capabilities_from_mcp() builds
+one composite capability string per tool from the name, description,
+and parameter names — giving the MinHash engine maximum n-gram surface.
 """
 
 import alps_discovery as alps
@@ -48,6 +49,7 @@ summarize_tools = [
 ]
 
 # Extract capabilities from MCP tool schemas
+# Each tool becomes one composite string: "name: description. param1, param2"
 translate_caps = alps.capabilities_from_mcp(translate_tools)
 summarize_caps = alps.capabilities_from_mcp(summarize_tools)
 
@@ -73,13 +75,15 @@ network.register(
     metadata={"protocol": "mcp"},
 )
 
-# Now discover — queries match against tool names, descriptions, AND param descriptions
+# Discovery uses hybrid word+character shingling with a similarity threshold
+# (default 0.1) to filter noise matches.
 test_queries = [
     "translate legal contract to German",
     "detect language of this text",
     "summarize a legal document",
     "what language is this written in",
     "source text to translate",
+    "Add these two numbers together",  # should not match anything
 ]
 
 print("Discovery results:")
@@ -92,3 +96,6 @@ for q in test_queries:
     else:
         print(f"  '{q}' -> NO MATCHES")
     print()
+
+# You can also customize the threshold:
+# network = alps.LocalNetwork(similarity_threshold=0.2)  # stricter filtering

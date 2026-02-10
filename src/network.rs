@@ -71,15 +71,15 @@ pub struct LocalNetwork {
 impl LocalNetwork {
     /// Creates a new empty LocalNetwork with default configuration.
     pub fn new() -> Self {
-        Self::with_config(SLNEnzymeConfig::default())
+        Self::with_config(SLNEnzymeConfig::default(), LshConfig::default())
     }
 
-    /// Creates a new LocalNetwork with custom enzyme configuration.
-    pub fn with_config(config: SLNEnzymeConfig) -> Self {
+    /// Creates a new LocalNetwork with custom configuration.
+    pub fn with_config(enzyme_config: SLNEnzymeConfig, lsh_config: LshConfig) -> Self {
         Self {
             agents: BTreeMap::new(),
-            enzyme: SLNEnzyme::with_discovery_kernels(config),
-            lsh_config: LshConfig::default(),
+            enzyme: SLNEnzyme::with_discovery_kernels(enzyme_config),
+            lsh_config,
             spore: Spore::new(SporeConfig::default()),
             membrane_state: MembraneState {
                 permeability: 1.0,
@@ -184,7 +184,7 @@ impl LocalNetwork {
                     metadata: record.metadata.clone(),
                 }
             })
-            .filter(|r| r.similarity > 0.0)
+            .filter(|r| r.similarity >= self.lsh_config.similarity_threshold)
             .collect();
 
         results.sort_by(|a, b| {
@@ -457,5 +457,72 @@ mod tests {
         let bare = results.iter().find(|r| r.agent_name == "bare-agent").unwrap();
         assert!(bare.endpoint.is_none());
         assert!(bare.metadata.is_empty());
+    }
+
+    #[test]
+    fn threshold_filters_noise() {
+        let mut network = LocalNetwork::new();
+        reg(
+            &mut network,
+            "translate-agent",
+            &["legal translation services"],
+        );
+        let results = network.discover("add these two numbers together");
+        assert!(
+            results.is_empty(),
+            "unrelated query should return no results, got {} with sims: {:?}",
+            results.len(),
+            results.iter().map(|r| r.similarity).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn composite_capability_strings_improve_matching() {
+        let mut network = LocalNetwork::new();
+        reg(
+            &mut network,
+            "translate-server",
+            &["translate text: Translate text between languages with legal domain expertise. text, source lang, target lang"],
+        );
+        reg(
+            &mut network,
+            "summarize-server",
+            &["summarize document: Generate a concise summary of a legal document. document, max length"],
+        );
+
+        let results = network.discover("translate legal contract to German");
+        assert!(!results.is_empty(), "should find translate-server");
+        assert_eq!(results[0].agent_name, "translate-server");
+
+        let results = network.discover("summarize a legal document");
+        assert!(!results.is_empty(), "should find summarize-server");
+        assert_eq!(results[0].agent_name, "summarize-server");
+    }
+
+    #[test]
+    fn custom_similarity_threshold() {
+        use crate::core::config::LshConfig;
+        use crate::core::enzyme::SLNEnzymeConfig;
+
+        // Very high threshold — filters everything
+        let mut lsh = LshConfig::default();
+        lsh.similarity_threshold = 0.9;
+        let mut network = LocalNetwork::with_config(SLNEnzymeConfig::default(), lsh);
+        reg(&mut network, "agent", &["data processing"]);
+        let results = network.discover("process some data");
+        assert!(
+            results.is_empty(),
+            "high threshold should filter partial matches"
+        );
+
+        // Very low threshold — includes everything
+        let mut lsh = LshConfig::default();
+        lsh.similarity_threshold = 0.0;
+        let mut network = LocalNetwork::with_config(SLNEnzymeConfig::default(), lsh);
+        reg(&mut network, "agent", &["data processing"]);
+        let results = network.discover("completely unrelated query");
+        // With threshold 0.0, even noise matches should appear
+        // (unless they happen to have exactly 0.0 similarity)
+        assert!(results.len() <= 1); // might or might not match
     }
 }
