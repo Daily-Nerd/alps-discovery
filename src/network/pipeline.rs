@@ -392,10 +392,26 @@ pub fn run_pipeline_with_scores(
         .collect();
     all_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
+    // Pre-filter by metadata BEFORE building candidate refs (Requirement 16).
+    // This reduces expensive enzyme evaluation and feedback lookup for filtered agents.
+    let metadata_passes = |record: &AgentRecord| -> bool {
+        if let Some(filters) = filters {
+            filters
+                .iter()
+                .all(|(key, filter)| match record.metadata.get(key) {
+                    Some(value) => filter.matches(value),
+                    None => false,
+                })
+        } else {
+            true // No filters, all pass
+        }
+    };
+
     // Build lightweight references — no cloning yet.
     let mut refs: Vec<CandidateRef<'_>> = agents
         .iter()
         .filter(|(_, r)| !r.hypha.state.is_circuit_open())
+        .filter(|(_, r)| metadata_passes(r)) // Pre-filter by metadata (Requirement 16)
         .filter_map(|(name, record)| {
             let sim = score_map.get(name.as_str()).copied().unwrap_or(0.0);
             if sim < scorer.lsh_config.similarity_threshold {
@@ -433,17 +449,8 @@ pub fn run_pipeline_with_scores(
         })
         .collect();
 
-    // Apply metadata filters before sorting.
-    if let Some(filters) = filters {
-        refs.retain(|r| {
-            filters
-                .iter()
-                .all(|(key, filter)| match r.metadata.get(key) {
-                    Some(value) => filter.matches(value),
-                    None => false,
-                })
-        });
-    }
+    // Metadata filters already applied in pre-filter above (Requirement 16).
+    // No post-filtering needed.
 
     refs.sort_by(|a, b| {
         b.final_score

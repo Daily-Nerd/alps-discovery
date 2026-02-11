@@ -45,6 +45,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<pybridge::PyMycorrhizalPropagator>()?;
     m.add_class::<pybridge::PyCircuitBreakerConfig>()?;
     m.add_class::<pybridge::PyDiscoveryConfig>()?;
+    m.add_class::<pybridge::PyFilterValue>()?;
     m.add_function(wrap_pyfunction!(pybridge::capabilities_from_a2a_rust, m)?)?;
     Ok(())
 }

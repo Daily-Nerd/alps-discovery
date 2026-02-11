@@ -534,7 +534,12 @@ impl PyLocalNetwork {
     ) -> PyResult<crate::network::FilterValue> {
         let value = value.bind(py);
 
-        // Try as dict first (operator syntax).
+        // Try PyFilterValue first (direct FilterValue object).
+        if let Ok(py_filter) = value.extract::<PyFilterValue>() {
+            return Ok(py_filter.inner);
+        }
+
+        // Try as dict second (operator syntax).
         if let Ok(dict) = value.cast::<pyo3::types::PyDict>() {
             if let Some(v) = dict.get_item("$in")? {
                 let options: Vec<String> = v.extract()?;
@@ -713,6 +718,7 @@ impl PyLocalNetwork {
             dissenting_kernel,
             alternative_agents,
             recommended_parallelism: resp.recommended_parallelism,
+            best_below_threshold: resp.best_below_threshold,
         };
         Ok(py_resp.into_pyobject(py)?.into_any().unbind())
     }
@@ -853,6 +859,10 @@ pub struct PyDiscoveryResponse {
     pub alternative_agents: Vec<String>,
     #[pyo3(get)]
     pub recommended_parallelism: usize,
+    /// When results are empty, reports the highest similarity score that was filtered out.
+    /// Format: (agent_name, similarity_score) or None if results are not empty.
+    #[pyo3(get)]
+    pub best_below_threshold: Option<(String, f64)>,
 }
 
 #[pymethods]
@@ -1305,6 +1315,76 @@ impl PyDiscoveryConfig {
 
 impl PyDiscoveryConfig {
     pub fn inner(&self) -> crate::core::config::DiscoveryConfig {
+        self.inner.clone()
+    }
+}
+
+/// Filter condition for metadata-based filtering.
+#[pyclass(name = "FilterValue")]
+#[derive(Clone)]
+pub struct PyFilterValue {
+    inner: crate::network::FilterValue,
+}
+
+#[pymethods]
+impl PyFilterValue {
+    /// Create an exact match filter.
+    #[staticmethod]
+    fn exact(value: String) -> Self {
+        Self {
+            inner: crate::network::FilterValue::Exact(value),
+        }
+    }
+
+    /// Create a contains filter (substring match).
+    #[staticmethod]
+    fn contains(substring: String) -> Self {
+        Self {
+            inner: crate::network::FilterValue::Contains(substring),
+        }
+    }
+
+    /// Create a one-of filter (value must be in list).
+    #[staticmethod]
+    fn one_of(options: Vec<String>) -> Self {
+        Self {
+            inner: crate::network::FilterValue::OneOf(options),
+        }
+    }
+
+    /// Create a less-than filter (for numeric values).
+    #[staticmethod]
+    fn less_than(threshold: f64) -> Self {
+        Self {
+            inner: crate::network::FilterValue::LessThan(threshold),
+        }
+    }
+
+    /// Create a greater-than filter (for numeric values).
+    #[staticmethod]
+    fn greater_than(threshold: f64) -> Self {
+        Self {
+            inner: crate::network::FilterValue::GreaterThan(threshold),
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        match &self.inner {
+            crate::network::FilterValue::Exact(v) => format!("FilterValue.Exact('{}')", v),
+            crate::network::FilterValue::Contains(v) => format!("FilterValue.Contains('{}')", v),
+            crate::network::FilterValue::OneOf(opts) => {
+                format!("FilterValue.OneOf({:?})", opts)
+            }
+            crate::network::FilterValue::LessThan(t) => format!("FilterValue.LessThan({})", t),
+            crate::network::FilterValue::GreaterThan(t) => {
+                format!("FilterValue.GreaterThan({})", t)
+            }
+        }
+    }
+}
+
+impl PyFilterValue {
+    pub fn inner(&self) -> crate::network::FilterValue {
         self.inner.clone()
     }
 }
