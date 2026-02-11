@@ -12,6 +12,7 @@ mod enzyme_adapter;
 
 mod cooccurrence;
 mod filter;
+mod mycorrhizal;
 mod persistence;
 
 #[cfg(feature = "bench")]
@@ -78,6 +79,7 @@ pub struct DriftReport {
 // Internal imports from sub-modules.
 use cooccurrence::CoOccurrenceExpander;
 use enzyme_adapter::EnzymeAdapter;
+use mycorrhizal::MycorrhizalPropagator;
 use pipeline::{derive_confidence, run_pipeline, run_pipeline_with_scores};
 use registry::AgentRecord;
 use scorer_adapter::ScorerAdapter;
@@ -106,6 +108,8 @@ pub struct LocalNetwork {
     replay: Mutex<ReplayLog>,
     /// Co-occurrence query expander: learns term associations from feedback.
     cooccurrence: Mutex<CoOccurrenceExpander>,
+    /// Mycorrhizal propagator: transitive feedback to similar agents.
+    mycorrhizal: MycorrhizalPropagator,
 }
 
 impl LocalNetwork {
@@ -119,6 +123,7 @@ impl LocalNetwork {
             total_feedback_count: AtomicU64::new(0),
             replay: Mutex::new(ReplayLog::disabled()),
             cooccurrence: Mutex::new(CoOccurrenceExpander::new()),
+            mycorrhizal: MycorrhizalPropagator::new(),
         }
     }
 
@@ -132,6 +137,7 @@ impl LocalNetwork {
             total_feedback_count: AtomicU64::new(0),
             replay: Mutex::new(ReplayLog::disabled()),
             cooccurrence: Mutex::new(CoOccurrenceExpander::new()),
+            mycorrhizal: MycorrhizalPropagator::new(),
         }
     }
 
@@ -148,12 +154,22 @@ impl LocalNetwork {
             total_feedback_count: AtomicU64::new(0),
             replay: Mutex::new(ReplayLog::disabled()),
             cooccurrence: Mutex::new(CoOccurrenceExpander::new()),
+            mycorrhizal: MycorrhizalPropagator::new(),
         }
     }
 
     /// Sets a custom exploration configuration.
     pub fn with_exploration(mut self, exploration: ExplorationConfig) -> Self {
         self.exploration = exploration;
+        self
+    }
+
+    /// Sets a custom mycorrhizal propagation configuration.
+    ///
+    /// Controls transitive feedback: success signals propagate to similar agents.
+    /// Set `attenuation = 0.0` to disable propagation entirely (zero overhead).
+    pub fn with_mycorrhizal(mut self, propagator: MycorrhizalPropagator) -> Self {
+        self.mycorrhizal = propagator;
         self
     }
 
@@ -503,6 +519,7 @@ impl LocalNetwork {
     /// affecting unrelated query types.
     ///
     /// Global diameter adjustment always applies regardless of query.
+    /// Mycorrhizal propagation: success signals propagate to similar agents.
     #[tracing::instrument(skip(self), fields(agent_name, query_provided = query.is_some()))]
     pub fn record_success(&mut self, agent_name: &str, query: Option<&str>) {
         registry::record_success(&mut self.agents, &self.scorer.lsh_config, agent_name, query);
@@ -536,6 +553,22 @@ impl LocalNetwork {
                 safe_lock(&self.cooccurrence, "cooccurrence record_success")
                     .record_feedback(&query_tokens, &agent_cap_tokens);
             }
+        }
+
+        // Mycorrhizal propagation: propagate success to similar agents
+        // First collect capabilities (releasing the immutable borrow)
+        let agent_caps: Option<Vec<String>> =
+            self.agents.get(agent_name).map(|r| r.capabilities.clone());
+
+        if let Some(caps) = agent_caps {
+            let caps_refs: Vec<&str> = caps.iter().map(|s| s.as_str()).collect();
+            self.mycorrhizal.propagate_feedback(
+                agent_name,
+                &caps_refs,
+                1.0, // outcome: success
+                self.scorer.scorer(),
+                &mut self.agents,
+            );
         }
     }
 
@@ -1177,7 +1210,9 @@ mod tests {
         // Two identical agents. Record translation successes for agent-a.
         // Translation-like queries should prefer agent-a.
         // Summarization queries should NOT prefer agent-a.
-        let mut network = LocalNetwork::new();
+        // Disable mycorrhizal propagation to test isolated per-query feedback.
+        let mut network =
+            LocalNetwork::new().with_mycorrhizal(MycorrhizalPropagator::with_config(0.0, 0.3));
         reg(
             &mut network,
             "agent-a",
@@ -3013,5 +3048,112 @@ mod tests {
         let results = network.discover("interpret");
         // Expansion enables finding the agent
         assert!(!results.is_empty() || !network.agents.is_empty());
+    }
+
+    // --- Task 12.2: Mycorrhizal propagation integration tests ---
+
+    #[test]
+    fn mycorrhizal_propagation_boosts_similar_agents() {
+        // GIVEN: Three agents - A and B are similar, C is unrelated
+        let mut network = LocalNetwork::new();
+        reg(
+            &mut network,
+            "agent-a",
+            &["translate text", "convert language"],
+        );
+        reg(
+            &mut network,
+            "agent-b",
+            &["translate document", "convert text"],
+        ); // Similar to A
+        reg(
+            &mut network,
+            "agent-c",
+            &["summarize document", "extract facts"],
+        ); // Unrelated
+
+        // Capture initial tau values
+        let initial_tau_b = network.agents["agent-b"].hypha.state.tau;
+        let initial_tau_c = network.agents["agent-c"].hypha.state.tau;
+
+        // WHEN: Recording 10 successful feedback events for agent-a
+        for _ in 0..10 {
+            network.record_success("agent-a", Some("translate"));
+        }
+
+        // THEN: Similar agent-b should have higher tau than unrelated agent-c
+        let final_tau_b = network.agents["agent-b"].hypha.state.tau;
+        let final_tau_c = network.agents["agent-c"].hypha.state.tau;
+
+        assert!(
+            final_tau_b > initial_tau_b,
+            "Similar agent-b should receive tau boost via mycorrhizal propagation"
+        );
+        assert!(
+            final_tau_b > final_tau_c,
+            "Similar agent-b (tau={:.4}) should have higher tau than unrelated agent-c (tau={:.4})",
+            final_tau_b,
+            final_tau_c
+        );
+
+        // agent-c should have minimal or no change (no overlap with agent-a)
+        let tau_c_delta = final_tau_c - initial_tau_c;
+        let tau_b_delta = final_tau_b - initial_tau_b;
+        assert!(
+            tau_b_delta > tau_c_delta,
+            "Tau boost for similar agent should be much larger than unrelated agent"
+        );
+    }
+
+    #[test]
+    fn mycorrhizal_propagation_disabled_when_attenuation_zero() {
+        // GIVEN: A network with mycorrhizal propagation disabled
+        let mut network =
+            LocalNetwork::new().with_mycorrhizal(MycorrhizalPropagator::with_config(0.0, 0.3));
+
+        reg(&mut network, "agent-a", &["translate text"]);
+        reg(&mut network, "agent-b", &["translate document"]); // Similar to A
+
+        let initial_tau_b = network.agents["agent-b"].hypha.state.tau;
+
+        // WHEN: Recording success for agent-a
+        for _ in 0..10 {
+            network.record_success("agent-a", Some("translate"));
+        }
+
+        // THEN: agent-b should not receive any propagated boost
+        let final_tau_b = network.agents["agent-b"].hypha.state.tau;
+        assert_eq!(
+            final_tau_b, initial_tau_b,
+            "With attenuation=0.0, no transitive feedback should occur"
+        );
+    }
+
+    #[test]
+    fn mycorrhizal_propagation_respects_threshold() {
+        // GIVEN: A network with high propagation threshold
+        let mut network =
+            LocalNetwork::new().with_mycorrhizal(MycorrhizalPropagator::with_config(0.3, 0.95)); // Very high threshold
+
+        reg(&mut network, "agent-a", &["translate text"]);
+        reg(
+            &mut network,
+            "agent-b",
+            &["somewhat different capabilities"],
+        ); // Low overlap with A
+
+        let initial_tau_b = network.agents["agent-b"].hypha.state.tau;
+
+        // WHEN: Recording success for agent-a
+        for _ in 0..5 {
+            network.record_success("agent-a", Some("translate"));
+        }
+
+        // THEN: agent-b should not receive boost (overlap below threshold)
+        let final_tau_b = network.agents["agent-b"].hypha.state.tau;
+        assert_eq!(
+            final_tau_b, initial_tau_b,
+            "Agents with overlap below threshold should not receive propagated feedback"
+        );
     }
 }
