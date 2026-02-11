@@ -302,7 +302,7 @@ impl LocalNetwork {
                 query: query.to_string(),
             });
         let cooccurrence = safe_lock(&self.cooccurrence, "cooccurrence");
-        let (candidates, _) = run_pipeline(
+        let (candidates, _, _best_below_threshold) = run_pipeline(
             &self.agents,
             &self.scorer,
             &mut safe_lock(&self.enzyme, "enzyme"),
@@ -340,7 +340,7 @@ impl LocalNetwork {
     ) -> Vec<ExplainedResult> {
         let epsilon = self.current_epsilon();
         let cooccurrence = safe_lock(&self.cooccurrence, "cooccurrence");
-        let (candidates, _) = run_pipeline(
+        let (candidates, _, _best_below_threshold) = run_pipeline(
             &self.agents,
             &self.scorer,
             &mut safe_lock(&self.enzyme, "enzyme"),
@@ -403,7 +403,7 @@ impl LocalNetwork {
         let epsilon = self.current_epsilon();
         let mut enzyme = safe_lock(&self.enzyme, "enzyme discover");
         let cooccurrence = safe_lock(&self.cooccurrence, "cooccurrence");
-        let (candidates, kernel_eval) = run_pipeline(
+        let (candidates, kernel_eval, best_below_threshold) = run_pipeline(
             &self.agents,
             &self.scorer,
             &mut enzyme,
@@ -418,7 +418,7 @@ impl LocalNetwork {
             results: candidates.into_iter().map(|c| c.into_result()).collect(),
             confidence: Some(confidence),
             recommended_parallelism,
-            best_below_threshold: None, // TODO: implement threshold tracking
+            best_below_threshold,
         }
     }
 
@@ -445,7 +445,7 @@ impl LocalNetwork {
         };
         let primary = query.primary_text().unwrap_or("");
         let epsilon = self.current_epsilon();
-        let (candidates, _) = run_pipeline_with_scores(
+        let (candidates, _, _best_below_threshold) = run_pipeline_with_scores(
             &self.agents,
             &self.scorer,
             &mut safe_lock(&self.enzyme, "enzyme"),
@@ -472,7 +472,7 @@ impl LocalNetwork {
         };
         let primary = query.primary_text().unwrap_or("");
         let epsilon = self.current_epsilon();
-        let (candidates, _) = run_pipeline_with_scores(
+        let (candidates, _, _best_below_threshold) = run_pipeline_with_scores(
             &self.agents,
             &self.scorer,
             &mut safe_lock(&self.enzyme, "enzyme"),
@@ -505,7 +505,7 @@ impl LocalNetwork {
         let primary = query.primary_text().unwrap_or("");
         let epsilon = self.current_epsilon();
         let mut enzyme = safe_lock(&self.enzyme, "enzyme discover");
-        let (candidates, kernel_eval) = run_pipeline_with_scores(
+        let (candidates, kernel_eval, best_below_threshold) = run_pipeline_with_scores(
             &self.agents,
             &self.scorer,
             &mut enzyme,
@@ -520,7 +520,7 @@ impl LocalNetwork {
             results: candidates.into_iter().map(|c| c.into_result()).collect(),
             confidence: Some(confidence),
             recommended_parallelism,
-            best_below_threshold: None, // TODO: implement threshold tracking
+            best_below_threshold,
         }
     }
 
@@ -872,7 +872,7 @@ impl<'a> DiscoveryBuilder<'a> {
         // Filters is just a type alias for HashMap, pass it directly
         let filters_opt: Option<&Filters> = self.filters;
 
-        let (candidates, kernel_eval) = run_pipeline(
+        let (candidates, kernel_eval, best_below_threshold) = run_pipeline(
             &self.network.agents,
             &self.network.scorer,
             &mut enzyme,
@@ -929,7 +929,7 @@ impl<'a> DiscoveryBuilder<'a> {
             results,
             confidence,
             recommended_parallelism,
-            best_below_threshold: None, // TODO: implement threshold tracking
+            best_below_threshold,
         })
     }
 }

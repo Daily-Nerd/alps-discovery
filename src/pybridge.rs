@@ -1125,3 +1125,120 @@ impl PyCircuitBreakerConfig {
         self.inner.clone()
     }
 }
+
+/// Extract capability strings from a Google A2A AgentCard.
+///
+/// Parses an A2A AgentCard JSON value and extracts capability descriptions
+/// from the agent name, description, skills, and tags. This enables ALPS
+/// to discover A2A agents using the same local discovery mechanism as MCP tools.
+///
+/// Args:
+///     agent_card: JSON value (dict-like) with optional fields:
+///         - name: Agent name
+///         - description: Agent description
+///         - skills: List of skill objects with name, description, tags
+///
+/// Returns:
+///     List of capability strings for use with register().
+///
+/// Example:
+///     ```python
+///     agent_card = {
+///         "name": "legal-assistant",
+///         "description": "Legal document analysis",
+///         "skills": [{
+///             "name": "analyze_contract",
+///             "description": "Analyze legal contracts",
+///             "tags": ["legal", "contracts"]
+///         }]
+///     }
+///     caps = capabilities_from_a2a_rust(agent_card)
+///     network.register("legal-agent", caps)
+///     ```
+#[pyfunction]
+pub fn capabilities_from_a2a_rust(agent_card: &Bound<'_, PyAny>) -> PyResult<Vec<String>> {
+    let mut caps = Vec::new();
+
+    // Extract agent-level name and description
+    let name = agent_card
+        .get_item("name")
+        .ok()
+        .and_then(|v| v.extract::<String>().ok())
+        .unwrap_or_default()
+        .replace(['-', '_'], " ")
+        .trim()
+        .to_string();
+
+    let desc = agent_card
+        .get_item("description")
+        .ok()
+        .and_then(|v| v.extract::<String>().ok())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+
+    // Build agent-level capability
+    let mut agent_parts = Vec::new();
+    if !name.is_empty() && !desc.is_empty() {
+        agent_parts.push(format!("{}: {}", name, desc));
+    } else if !name.is_empty() {
+        agent_parts.push(name.clone());
+    } else if !desc.is_empty() {
+        agent_parts.push(desc.clone());
+    }
+
+    if !agent_parts.is_empty() {
+        caps.push(agent_parts.join(". "));
+    }
+
+    // Extract skill-level capabilities
+    if let Ok(skills) = agent_card.get_item("skills") {
+        if let Ok(skills_list) = skills.extract::<Vec<Bound<'_, PyAny>>>() {
+            for skill in skills_list {
+                let skill_name = skill
+                    .get_item("name")
+                    .ok()
+                    .and_then(|v| v.extract::<String>().ok())
+                    .unwrap_or_default()
+                    .replace('_', " ")
+                    .trim()
+                    .to_string();
+
+                let skill_desc = skill
+                    .get_item("description")
+                    .ok()
+                    .and_then(|v| v.extract::<String>().ok())
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+
+                let skill_tags = skill
+                    .get_item("tags")
+                    .ok()
+                    .and_then(|v| v.extract::<Vec<String>>().ok())
+                    .unwrap_or_default();
+
+                // Build skill capability
+                let mut skill_parts = Vec::new();
+                if !skill_name.is_empty() && !skill_desc.is_empty() {
+                    skill_parts.push(format!("{}: {}", skill_name, skill_desc));
+                } else if !skill_name.is_empty() {
+                    skill_parts.push(skill_name);
+                } else if !skill_desc.is_empty() {
+                    skill_parts.push(skill_desc);
+                }
+
+                // Add tags
+                if !skill_tags.is_empty() {
+                    skill_parts.push(skill_tags.join(", "));
+                }
+
+                if !skill_parts.is_empty() {
+                    caps.push(skill_parts.join(". "));
+                }
+            }
+        }
+    }
+
+    Ok(caps)
+}

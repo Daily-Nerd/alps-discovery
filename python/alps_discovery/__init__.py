@@ -77,6 +77,82 @@ def capabilities_from_mcp(tools: list[dict]) -> list[str]:
     return caps
 
 
+def capabilities_from_a2a(agent_card: dict) -> list[str]:
+    """Extract capability strings from Google A2A AgentCard.
+
+    Parses an A2A AgentCard JSON object and extracts capability descriptions
+    from the agent name, description, skills, and tags. This enables ALPS
+    to discover A2A agents using the same local discovery mechanism as MCP tools.
+
+    Args:
+        agent_card: A2A AgentCard dict with optional fields:
+            - name: Agent name
+            - description: Agent description
+            - skills: List of skill objects with name, description, tags
+
+    Returns:
+        List of capability strings for use with register().
+
+    Example:
+        agent_card = {
+            "name": "legal-assistant",
+            "description": "Legal document analysis",
+            "skills": [
+                {
+                    "name": "analyze_contract",
+                    "description": "Analyze legal contracts",
+                    "tags": ["legal", "contracts", "risk-analysis"]
+                }
+            ]
+        }
+        caps = capabilities_from_a2a(agent_card)
+        network.register("legal-agent", caps)
+    """
+    caps = []
+
+    # Extract agent-level name and description
+    name = agent_card.get("name", "").replace("-", " ").replace("_", " ").strip()
+    desc = agent_card.get("description", "").strip()
+
+    # Build agent-level capability
+    agent_parts = []
+    if name and desc:
+        agent_parts.append(f"{name}: {desc}")
+    elif name:
+        agent_parts.append(name)
+    elif desc:
+        agent_parts.append(desc)
+
+    if agent_parts:
+        caps.append(". ".join(agent_parts))
+
+    # Extract skill-level capabilities
+    skills = agent_card.get("skills", [])
+    for skill in skills:
+        skill_name = skill.get("name", "").replace("_", " ").strip()
+        skill_desc = skill.get("description", "").strip()
+        skill_tags = skill.get("tags", [])
+
+        # Build skill capability: "name: description. tag1, tag2, tag3"
+        skill_parts = []
+        if skill_name and skill_desc:
+            skill_parts.append(f"{skill_name}: {skill_desc}")
+        elif skill_name:
+            skill_parts.append(skill_name)
+        elif skill_desc:
+            skill_parts.append(skill_desc)
+
+        # Add tags as additional tokens
+        if skill_tags:
+            tags_str = ", ".join(str(tag) for tag in skill_tags)
+            skill_parts.append(tags_str)
+
+        if skill_parts:
+            caps.append(". ".join(skill_parts))
+
+    return caps
+
+
 __all__ = [
     "DiscoveryResponse",
     "DiscoveryResult",
@@ -84,5 +160,6 @@ __all__ = [
     "LocalNetwork",
     "Query",
     "TfIdfScorer",
+    "capabilities_from_a2a",
     "capabilities_from_mcp",
 ]

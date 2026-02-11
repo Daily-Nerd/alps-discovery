@@ -261,6 +261,7 @@ pub(crate) fn derive_confidence(
 ///
 /// Scores all agents via the scorer, then delegates to `run_pipeline_with_scores`.
 /// `exploration_epsilon` controls the probability of shuffling tied agents (0.0 = pure exploit, 1.0 = always explore).
+/// Returns: (results, kernel_evaluation, best_below_threshold)
 /// Public for benchmark access when `bench` feature is enabled.
 pub fn run_pipeline(
     agents: &BTreeMap<String, AgentRecord>,
@@ -270,7 +271,11 @@ pub fn run_pipeline(
     filters: Option<&Filters>,
     exploration_epsilon: f64,
     cooccurrence: &CoOccurrenceExpander,
-) -> (Vec<ScoredCandidate>, KernelEvaluation) {
+) -> (
+    Vec<ScoredCandidate>,
+    KernelEvaluation,
+    Option<(String, f64)>,
+) {
     // Tokenize query for co-occurrence expansion (simple whitespace tokenization)
     let query_tokens: Vec<String> = query.split_whitespace().map(|s| s.to_lowercase()).collect();
 
@@ -289,6 +294,7 @@ pub fn run_pipeline(
                     agent_scores: HashMap::new(),
                     top_picks: Vec::new(),
                 },
+                None,
             );
         }
     };
@@ -308,6 +314,7 @@ pub fn run_pipeline(
 ///
 /// `query_text` is used for the Signal/Tendril construction and feedback matching.
 /// `score_map` provides per-agent similarity scores (from Scorer or Query algebra).
+/// Returns: (results, kernel_evaluation, best_below_threshold)
 /// Public for benchmark access when `bench` feature is enabled.
 pub fn run_pipeline_with_scores(
     agents: &BTreeMap<String, AgentRecord>,
@@ -317,7 +324,11 @@ pub fn run_pipeline_with_scores(
     score_map: HashMap<String, f64>,
     filters: Option<&Filters>,
     exploration_epsilon: f64,
-) -> (Vec<ScoredCandidate>, KernelEvaluation) {
+) -> (
+    Vec<ScoredCandidate>,
+    KernelEvaluation,
+    Option<(String, f64)>,
+) {
     if agents.is_empty() {
         return (
             Vec::new(),
@@ -325,6 +336,7 @@ pub fn run_pipeline_with_scores(
                 agent_scores: HashMap::new(),
                 top_picks: Vec::new(),
             },
+            None, // No agents, no best_below_threshold
         );
     }
 
@@ -370,6 +382,15 @@ pub fn run_pipeline_with_scores(
 
     // Run enzyme evaluation with scorer context.
     let kernel_eval = enzyme.evaluate_with_scores(&signal, &hyphae, &scorer_context);
+
+    // Track best score below threshold for diagnostics (Requirement 23).
+    // We track ALL agents (including circuit-open and below-threshold) to report
+    // the highest similarity when results are empty.
+    let mut all_scores: Vec<(String, f64)> = score_map
+        .iter()
+        .map(|(name, &sim)| (name.clone(), sim))
+        .collect();
+    all_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
     // Build lightweight references — no cloning yet.
     let mut refs: Vec<CandidateRef<'_>> = agents
@@ -533,7 +554,16 @@ pub fn run_pipeline_with_scores(
         }
     }
 
-    (results, kernel_eval)
+    // Compute best_below_threshold diagnostic (Requirement 23).
+    // When results are empty, report the highest similarity score among all agents.
+    // This helps distinguish "nothing relevant" (0.0) from "close but below threshold" (e.g., 0.09).
+    let best_below_threshold = if results.is_empty() && !all_scores.is_empty() {
+        Some(all_scores[0].clone())
+    } else {
+        None
+    };
+
+    (results, kernel_eval, best_below_threshold)
 }
 
 #[cfg(test)]
@@ -583,5 +613,230 @@ mod tests {
         });
         let factor = compute_feedback_factor(&feedback, &minhash, 0.1);
         assert!(factor > 0.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Best-Below-Threshold Tracking (Requirement 23)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_best_below_threshold_populated_when_empty() {
+        use crate::core::config::LshConfig;
+        use crate::core::enzyme::SLNEnzymeConfig;
+        use crate::core::hyphae::Hypha;
+        use crate::core::pheromone::HyphaState;
+        use crate::network::cooccurrence::CoOccurrenceExpander;
+        use crate::network::enzyme_adapter::EnzymeAdapter;
+        use crate::network::registry::{name_to_hypha_id, AgentRecord, FeedbackIndex};
+        use crate::network::scorer_adapter::ScorerAdapter;
+        use std::collections::BTreeMap;
+
+        use crate::core::chemistry::Chemistry;
+        use crate::core::pheromone::{AtomicCounter, CircuitState};
+        use crate::core::types::PeerAddr;
+        use std::time::Instant;
+
+        let mut agents = BTreeMap::new();
+        let agent_name = "low-similarity-agent".to_string();
+        let hypha_id = name_to_hypha_id(&agent_name);
+        let mut metadata = HashMap::new();
+        metadata.insert("test".to_string(), "value".to_string());
+        let record = AgentRecord {
+            capabilities: vec!["test capability".to_string()],
+            endpoint: None,
+            metadata,
+            hypha: Hypha {
+                id: hypha_id,
+                peer: PeerAddr(format!("local://{}", agent_name)),
+                state: HyphaState {
+                    diameter: 1.0,
+                    tau: 0.01,
+                    sigma: 0.0,
+                    consecutive_pulse_timeouts: 0,
+                    forwards_count: AtomicCounter::new(0),
+                    conductance: 1.0,
+                    circuit_state: CircuitState::Closed,
+                },
+                chemistry: Chemistry::new(),
+                last_activity: Instant::now(),
+            },
+            feedback: FeedbackIndex::new(),
+        };
+        agents.insert(agent_name, record);
+
+        let lsh_config = LshConfig {
+            similarity_threshold: 0.5, // High threshold
+            ..Default::default()
+        };
+        let scorer = ScorerAdapter::new(lsh_config);
+        let mut enzyme = EnzymeAdapter::new(SLNEnzymeConfig::default());
+        let _cooccurrence = CoOccurrenceExpander::new();
+
+        // Create a score map with similarity below threshold (0.3 < 0.5)
+        let mut score_map = HashMap::new();
+        score_map.insert("low-similarity-agent".to_string(), 0.3);
+
+        let (results, _, best_below_threshold) = run_pipeline_with_scores(
+            &agents,
+            &scorer,
+            &mut enzyme,
+            "test query",
+            score_map,
+            None,
+            0.0,
+        );
+
+        // Results should be empty (below threshold)
+        assert!(results.is_empty());
+
+        // Best below threshold should be populated with the filtered agent
+        assert_eq!(
+            best_below_threshold,
+            Some(("low-similarity-agent".to_string(), 0.3))
+        );
+    }
+
+    #[test]
+    fn test_best_below_threshold_none_when_results_present() {
+        use crate::core::config::LshConfig;
+        use crate::core::enzyme::SLNEnzymeConfig;
+        use crate::core::hyphae::Hypha;
+        use crate::core::pheromone::HyphaState;
+        use crate::network::cooccurrence::CoOccurrenceExpander;
+        use crate::network::enzyme_adapter::EnzymeAdapter;
+        use crate::network::registry::{name_to_hypha_id, AgentRecord, FeedbackIndex};
+        use crate::network::scorer_adapter::ScorerAdapter;
+        use std::collections::BTreeMap;
+
+        use crate::core::chemistry::Chemistry;
+        use crate::core::pheromone::{AtomicCounter, CircuitState};
+        use crate::core::types::PeerAddr;
+        use std::time::Instant;
+
+        let mut agents = BTreeMap::new();
+        let agent_name = "high-similarity-agent".to_string();
+        let hypha_id = name_to_hypha_id(&agent_name);
+        let record = AgentRecord {
+            capabilities: vec!["test capability".to_string()],
+            endpoint: None,
+            metadata: HashMap::new(),
+            hypha: Hypha {
+                id: hypha_id,
+                peer: PeerAddr(format!("local://{}", agent_name)),
+                state: HyphaState {
+                    diameter: 1.0,
+                    tau: 0.01,
+                    sigma: 0.0,
+                    consecutive_pulse_timeouts: 0,
+                    forwards_count: AtomicCounter::new(0),
+                    conductance: 1.0,
+                    circuit_state: CircuitState::Closed,
+                },
+                chemistry: Chemistry::new(),
+                last_activity: Instant::now(),
+            },
+            feedback: FeedbackIndex::new(),
+        };
+        agents.insert(agent_name, record);
+
+        let lsh_config = LshConfig::default(); // threshold = 0.1
+        let scorer = ScorerAdapter::new(lsh_config);
+        let mut enzyme = EnzymeAdapter::new(SLNEnzymeConfig::default());
+        let _cooccurrence = CoOccurrenceExpander::new();
+
+        // Create a score map with similarity above threshold
+        let mut score_map = HashMap::new();
+        score_map.insert("high-similarity-agent".to_string(), 0.8);
+
+        let (results, _, best_below_threshold) = run_pipeline_with_scores(
+            &agents,
+            &scorer,
+            &mut enzyme,
+            "test query",
+            score_map,
+            None,
+            0.0,
+        );
+
+        // Results should not be empty
+        assert!(!results.is_empty());
+
+        // Best below threshold should be None (results exist)
+        assert_eq!(best_below_threshold, None);
+    }
+
+    #[test]
+    fn test_best_below_threshold_zero_when_no_overlap() {
+        use crate::core::config::LshConfig;
+        use crate::core::enzyme::SLNEnzymeConfig;
+        use crate::core::hyphae::Hypha;
+        use crate::core::pheromone::HyphaState;
+        use crate::network::cooccurrence::CoOccurrenceExpander;
+        use crate::network::enzyme_adapter::EnzymeAdapter;
+        use crate::network::registry::{name_to_hypha_id, AgentRecord, FeedbackIndex};
+        use crate::network::scorer_adapter::ScorerAdapter;
+        use std::collections::BTreeMap;
+
+        use crate::core::chemistry::Chemistry;
+        use crate::core::pheromone::{AtomicCounter, CircuitState};
+        use crate::core::types::PeerAddr;
+        use std::time::Instant;
+
+        let mut agents = BTreeMap::new();
+        let agent_name = "no-overlap-agent".to_string();
+        let hypha_id = name_to_hypha_id(&agent_name);
+        let record = AgentRecord {
+            capabilities: vec!["test capability".to_string()],
+            endpoint: None,
+            metadata: HashMap::new(),
+            hypha: Hypha {
+                id: hypha_id,
+                peer: PeerAddr(format!("local://{}", agent_name)),
+                state: HyphaState {
+                    diameter: 1.0,
+                    tau: 0.01,
+                    sigma: 0.0,
+                    consecutive_pulse_timeouts: 0,
+                    forwards_count: AtomicCounter::new(0),
+                    conductance: 1.0,
+                    circuit_state: CircuitState::Closed,
+                },
+                chemistry: Chemistry::new(),
+                last_activity: Instant::now(),
+            },
+            feedback: FeedbackIndex::new(),
+        };
+        agents.insert(agent_name, record);
+
+        let lsh_config = LshConfig {
+            similarity_threshold: 0.1,
+            ..Default::default()
+        };
+        let scorer = ScorerAdapter::new(lsh_config);
+        let mut enzyme = EnzymeAdapter::new(SLNEnzymeConfig::default());
+        let _cooccurrence = CoOccurrenceExpander::new();
+
+        // Create a score map with zero similarity (no overlap)
+        let mut score_map = HashMap::new();
+        score_map.insert("no-overlap-agent".to_string(), 0.0);
+
+        let (results, _, best_below_threshold) = run_pipeline_with_scores(
+            &agents,
+            &scorer,
+            &mut enzyme,
+            "test query",
+            score_map,
+            None,
+            0.0,
+        );
+
+        // Results should be empty (zero similarity)
+        assert!(results.is_empty());
+
+        // Best below threshold should indicate no overlap (0.0)
+        assert_eq!(
+            best_below_threshold,
+            Some(("no-overlap-agent".to_string(), 0.0))
+        );
     }
 }
