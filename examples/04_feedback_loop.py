@@ -30,9 +30,14 @@ results = network.discover(query)
 for r in results:
     print(f"  {r.agent_name}: similarity={r.similarity:.3f}, score={r.score:.3f}")
 
-alpha = next(r for r in results if r.agent_name == "agent-alpha")
-beta = next(r for r in results if r.agent_name == "agent-beta")
-print(f"\n  Alpha/Beta score ratio: {alpha.score / beta.score:.1f}x")
+alpha = next((r for r in results if r.agent_name == "agent-alpha"), None)
+beta = next((r for r in results if r.agent_name == "agent-beta"), None)
+if alpha and beta:
+    print(f"\n  Alpha/Beta score ratio: {alpha.score / beta.score:.1f}x")
+elif alpha:
+    print("\n  Alpha ranked, Beta filtered out")
+else:
+    print(f"\n  Results: {[r.agent_name for r in results]}")
 
 # Can beta recover?
 print("\n=== Recovery: beta succeeds 40 rounds ===")
@@ -43,9 +48,14 @@ results = network.discover(query)
 for r in results:
     print(f"  {r.agent_name}: similarity={r.similarity:.3f}, score={r.score:.3f}")
 
-alpha = next(r for r in results if r.agent_name == "agent-alpha")
-beta = next(r for r in results if r.agent_name == "agent-beta")
-print(f"\n  Alpha/Beta score ratio: {alpha.score / beta.score:.1f}x")
+alpha = next((r for r in results if r.agent_name == "agent-alpha"), None)
+beta = next((r for r in results if r.agent_name == "agent-beta"), None)
+if alpha and beta:
+    print(f"\n  Alpha/Beta score ratio: {alpha.score / beta.score:.1f}x")
+elif alpha:
+    print("\n  Alpha ranked, Beta filtered out")
+else:
+    print(f"\n  Results: {[r.agent_name for r in results]}")
 
 print("\n  Note: diameter clamps to [0.1, 1.0], so agents converge")
 print("  toward 1.0 after enough successes. Prevents runaway.")

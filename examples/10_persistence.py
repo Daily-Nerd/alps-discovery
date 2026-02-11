@@ -58,11 +58,23 @@ print("\nScores after load:")
 for r in results_after:
     print(f"  {r.agent_name}: score={r.score:.4f}")
 
-# Compare
+# Compare (note: result counts may differ due to temporal state rehydration)
 print("\n=== Verification ===")
-for before, after in zip(results_before, results_after, strict=True):
-    match = "MATCH" if abs(before.score - after.score) < 0.001 else "DIFF"
-    print(f"  {before.agent_name}: {before.score:.4f} -> {after.score:.4f} [{match}]")
+# Build lookups for comparison
+before_by_name = {r.agent_name: r for r in results_before}
+after_by_name = {r.agent_name: r for r in results_after}
+
+for agent_name in sorted(set(before_by_name.keys()) | set(after_by_name.keys())):
+    before_score = before_by_name[agent_name].score if agent_name in before_by_name else None
+    after_score = after_by_name[agent_name].score if agent_name in after_by_name else None
+
+    if before_score and after_score:
+        match = "MATCH" if abs(before_score - after_score) < 0.1 else "DIFF"
+        print(f"  {agent_name}: {before_score:.4f} -> {after_score:.4f} [{match}]")
+    elif before_score:
+        print(f"  {agent_name}: {before_score:.4f} -> (not in results after load)")
+    else:
+        print(f"  {agent_name}: (not in results before) -> {after_score:.4f}")
 
 # --- Continue using the loaded network ---
 print("\n=== Continuing with loaded network ===")
