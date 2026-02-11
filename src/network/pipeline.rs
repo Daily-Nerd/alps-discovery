@@ -846,4 +846,47 @@ mod tests {
             Some(("no-overlap-agent".to_string(), 0.0))
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Property-Based Tests (Requirement 17)
+    // -----------------------------------------------------------------------
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Property test: feedback_factor always in [-1.0, 1.0] (Requirement 17).
+        ///
+        /// Verifies that the feedback factor computation never produces values
+        /// outside the valid range, regardless of input feedback records.
+        #[test]
+        fn proptest_feedback_factor_bounds(
+            outcome in -1.0f64..=1.0f64,
+            num_records in 0usize..20,
+        ) {
+            use crate::network::registry::FeedbackRecord;
+
+            let mut feedback = FeedbackIndex::new();
+            let query_minhash = [42u8; 64];
+
+            // Insert random feedback records
+            for i in 0..num_records {
+                let mut minhash = [0u8; 64];
+                // Create varied signatures for relevance testing
+                for (j, byte) in minhash.iter_mut().enumerate() {
+                    *byte = ((i * 7 + j * 13) % 256) as u8;
+                }
+                feedback.insert(FeedbackRecord {
+                    query_minhash: minhash,
+                    outcome,
+                });
+            }
+
+            let factor = compute_feedback_factor(&feedback, &query_minhash, 0.1);
+
+            prop_assert!(
+                (-1.0..=1.0).contains(&factor),
+                "feedback_factor {} must be in [-1.0, 1.0]", factor
+            );
+        }
+    }
 }

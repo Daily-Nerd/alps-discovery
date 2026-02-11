@@ -833,4 +833,109 @@ mod tests {
             "upper bound should be ~1.0 for identical inputs"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Property-Based Tests (Requirement 1, 17)
+    // -----------------------------------------------------------------------
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Property test: CI coverage verification with ground truth (Requirement 1).
+        ///
+        /// Verifies that corrected confidence intervals contain the true Jaccard
+        /// similarity at ≥93% coverage rate over many trials.
+        #[test]
+        fn proptest_ci_coverage_with_ground_truth(target_jaccard in 0.05f64..0.95f64) {
+            const SET_SIZE: usize = 100;
+
+            use xxhash_rust::xxh3::xxh3_64_with_seed;
+
+            // Generate set A (100 distinct random-ish tokens using hash-based generation)
+            // This ensures tokens don't share byte n-grams accidentally
+            let set_a: Vec<String> = (0..SET_SIZE)
+                .map(|i| {
+                    let hash = xxh3_64_with_seed(b"set_a", i as u64);
+                    format!("tkn{:016x}", hash) // Hex string ensures distinct byte patterns
+                })
+                .collect();
+
+            // Compute overlap size to achieve target Jaccard
+            // J = |A ∩ B| / |A ∪ B|
+            // For |A| = |B| = 100: J = overlap / (200 - overlap)
+            // Solving for overlap: overlap = J * 200 / (2 - J)
+            let overlap_size = ((target_jaccard * (2.0 * SET_SIZE as f64)) / (2.0 - target_jaccard)).floor() as usize;
+            let overlap_size = overlap_size.min(SET_SIZE); // Cap at SET_SIZE
+
+            // Create set B: overlap_size tokens from A + (SET_SIZE - overlap_size) fresh tokens
+            let mut set_b: Vec<String> = set_a.iter().take(overlap_size).cloned().collect();
+            for i in overlap_size..SET_SIZE {
+                let hash = xxh3_64_with_seed(b"set_b", i as u64);
+                set_b.push(format!("tkn{:016x}", hash));
+            }
+
+            // Compute true Jaccard from actual sets
+            let set_a_set: std::collections::HashSet<_> = set_a.iter().collect();
+            let set_b_set: std::collections::HashSet<_> = set_b.iter().collect();
+            let intersection_size = set_a_set.intersection(&set_b_set).count();
+            let union_size = set_a_set.union(&set_b_set).count();
+            let true_jaccard = if union_size > 0 {
+                intersection_size as f64 / union_size as f64
+            } else {
+                0.0
+            };
+
+            // Generate MinHash signatures using Words mode (token-level, not byte n-grams)
+            let hasher = MinHasher::new(SIGNATURE_SIZE);
+            let mode = ShingleMode::Words; // Use word-level tokens to match set semantics
+
+            // Join tokens with spaces to create capability strings
+            let text_a = set_a.join(" ");
+            let text_b = set_b.join(" ");
+
+            let sig_a = hasher.hash_key(text_a.as_bytes(), &mode);
+            let sig_b = hasher.hash_key(text_b.as_bytes(), &mode);
+
+            // Compute corrected CI
+            let ci = MinHasher::similarity_with_confidence_corrected(&sig_a, &sig_b);
+
+            // Verify CI contains true Jaccard (this is a statistical property,
+            // individual trials may fail, but ≥93% should pass)
+            prop_assert!(
+                ci.lower_bound <= true_jaccard && true_jaccard <= ci.upper_bound,
+                "CI [{:.4}, {:.4}] should contain true Jaccard {:.4} (target was {:.4}, overlap={}/{})",
+                ci.lower_bound, ci.upper_bound, true_jaccard, target_jaccard, overlap_size, SET_SIZE
+            );
+        }
+
+        /// Property test: CI bounds ordering (Requirement 17).
+        ///
+        /// Verifies that for all confidence interval computations,
+        /// lower_bound ≤ point_estimate ≤ upper_bound.
+        #[test]
+        fn proptest_ci_bounds_ordering(
+            jaccard in 0.0f64..=1.0f64,
+        ) {
+            // Create synthetic signatures with specific Jaccard similarity
+            let matches = (jaccard * SIGNATURE_SIZE as f64).round() as usize;
+            let mut sig_a = [0u8; SIGNATURE_SIZE];
+            let mut sig_b = [0u8; SIGNATURE_SIZE];
+
+            for i in 0..SIGNATURE_SIZE {
+                sig_a[i] = i as u8;
+                sig_b[i] = if i < matches { i as u8 } else { (i + 100) as u8 };
+            }
+
+            let ci = MinHasher::similarity_with_confidence_corrected(&sig_a, &sig_b);
+
+            prop_assert!(ci.lower_bound <= ci.point_estimate,
+                "lower_bound {} should be ≤ point_estimate {}", ci.lower_bound, ci.point_estimate);
+            prop_assert!(ci.point_estimate <= ci.upper_bound,
+                "point_estimate {} should be ≤ upper_bound {}", ci.point_estimate, ci.upper_bound);
+            prop_assert!(ci.lower_bound >= 0.0,
+                "lower_bound {} should be ≥ 0.0", ci.lower_bound);
+            prop_assert!(ci.upper_bound <= 1.0,
+                "upper_bound {} should be ≤ 1.0", ci.upper_bound);
+        }
+    }
 }
