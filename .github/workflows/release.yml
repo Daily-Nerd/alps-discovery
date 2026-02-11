@@ -15,31 +15,31 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            target: x86_64
+          - os: macos-latest
+            target: aarch64
+          - os: macos-latest
+            target: x86_64
+          - os: windows-latest
+            target: x86_64
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: stable
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install maturin
-        run: pip install maturin
-
       - name: Build wheels
-        run: maturin build --release --out dist/
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --out dist --interpreter 3.11 3.12 3.13
+          target: ${{ matrix.target }}
+          manylinux: '2_17'  # Broader Linux compatibility (glibc 2.17+)
 
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
-          name: wheels-${{ matrix.os }}
+          name: wheels-${{ matrix.os }}-${{ matrix.target }}
           path: dist/*.whl
 
   create-release:
@@ -52,6 +52,7 @@ jobs:
       - name: Download all wheels
         uses: actions/download-artifact@v4
         with:
+          pattern: wheels-*
           path: dist/
           merge-multiple: true
 
@@ -84,16 +85,15 @@ jobs:
       id-token: write  # Required for trusted publishing
 
     steps:
-      - uses: actions/checkout@v4
-
       - name: Download all wheels
         uses: actions/download-artifact@v4
         with:
+          pattern: wheels-*
           path: dist/
           merge-multiple: true
 
-      - name: Install maturin
-        run: pip install maturin
-
       - name: Publish to PyPI (Trusted Publisher)
-        run: maturin upload --skip-existing dist/*.whl
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+          skip-existing: true
