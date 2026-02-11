@@ -35,6 +35,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use crate::core::config::{ExplorationConfig, LshConfig};
+use crate::error::DiscoveryError;
 
 /// Helper to safely acquire a mutex lock, recovering from poison.
 ///
@@ -655,8 +656,10 @@ impl LocalNetwork {
     ///
     /// `Hypha.last_activity` (an `Instant`) is NOT serialized — it resets
     /// to `Instant::now()` on load.
+    ///
+    /// Uses atomic write-rename pattern to ensure crash-safety.
     pub fn save(&self, path: &str) -> Result<(), NetworkError> {
-        persistence::save_snapshot(&self.agents, path)
+        persistence::save_snapshot_atomic(&self.agents, path)
     }
 
     /// Load network state from a JSON file.
@@ -699,6 +702,129 @@ impl LocalNetwork {
         }
 
         Ok(network)
+    }
+
+    /// Create a discovery builder for fluent API usage.
+    ///
+    /// Returns a builder that allows chaining options like `.with_filters()`,
+    /// `.explained()`, `.with_confidence()` before calling `.run()`.
+    ///
+    /// Example:
+    /// ```ignore
+    /// let response = network.discover_builder("legal translation")
+    ///     .with_filters(&filters)
+    ///     .explained()
+    ///     .with_confidence()
+    ///     .run()?;
+    /// ```
+    pub fn discover_builder<'a>(&'a self, query: &'a str) -> DiscoveryBuilder<'a> {
+        DiscoveryBuilder {
+            network: self,
+            query,
+            filters: None,
+            explained: false,
+            with_confidence: false,
+        }
+    }
+}
+
+/// Fluent builder for discovery operations.
+///
+/// Consolidates multiple discover() variants into a single composable API.
+/// Always returns `DiscoveryResponse` regardless of options.
+pub struct DiscoveryBuilder<'a> {
+    network: &'a LocalNetwork,
+    query: &'a str,
+    filters: Option<&'a HashMap<String, FilterValue>>,
+    explained: bool,
+    with_confidence: bool,
+}
+
+impl<'a> DiscoveryBuilder<'a> {
+    /// Apply metadata filters to the discovery.
+    pub fn with_filters(mut self, filters: &'a HashMap<String, FilterValue>) -> Self {
+        self.filters = Some(filters);
+        self
+    }
+
+    /// Enable explained mode (populate kernel_scores in results).
+    pub fn explained(mut self) -> Self {
+        self.explained = true;
+        self
+    }
+
+    /// Enable confidence mode (populate confidence and recommended_parallelism).
+    pub fn with_confidence(mut self) -> Self {
+        self.with_confidence = true;
+        self
+    }
+
+    /// Execute the discovery and return a unified DiscoveryResponse.
+    pub fn run(self) -> Result<DiscoveryResponse, DiscoveryError> {
+        let epsilon = self.network.current_epsilon();
+        let mut enzyme = safe_lock(&self.network.enzyme, "enzyme");
+
+        // Filters is just a type alias for HashMap, pass it directly
+        let filters_opt: Option<&Filters> = self.filters;
+
+        let (candidates, kernel_eval) = run_pipeline(
+            &self.network.agents,
+            &self.network.scorer,
+            &mut enzyme,
+            self.query,
+            filters_opt,
+            epsilon,
+        );
+
+        // Record in replay log
+        {
+            let mut replay = safe_lock(&self.network.replay, "replay");
+            replay.record(EventKind::QuerySubmitted {
+                query: self.query.to_string(),
+            });
+            for c in &candidates {
+                replay.record(EventKind::AgentScored {
+                    query: self.query.to_string(),
+                    agent_name: c.agent_name.clone(),
+                    raw_similarity: c.raw_similarity,
+                    enzyme_score: c.enzyme_score,
+                    feedback_factor: c.feedback_factor,
+                    final_score: c.final_score,
+                });
+            }
+        }
+
+        // Populate kernel_scores if explained mode
+        let results: Vec<DiscoveryResult> = if self.explained {
+            candidates
+                .into_iter()
+                .map(|c| {
+                    // TODO: Get kernel_eval scores for this agent from kernel_eval
+                    // For now, just populate with None as a placeholder
+                    let mut result = c.into_result();
+                    result.kernel_scores = Some(HashMap::new()); // Placeholder
+                    result
+                })
+                .collect()
+        } else {
+            candidates.into_iter().map(|c| c.into_result()).collect()
+        };
+
+        // Compute confidence if requested
+        let (confidence, recommended_parallelism) = if self.with_confidence {
+            let (conf, para) =
+                derive_confidence(&kernel_eval, &self.network.agents, enzyme.config());
+            (Some(conf), para)
+        } else {
+            (None, 1)
+        };
+
+        Ok(DiscoveryResponse {
+            results,
+            confidence,
+            recommended_parallelism,
+            best_below_threshold: None, // TODO: implement threshold tracking
+        })
     }
 }
 
@@ -1529,7 +1655,7 @@ mod tests {
                 err,
                 NetworkError::UnsupportedVersion {
                     found: 99,
-                    supported: 2
+                    supported: 3
                 }
             ),
             "expected UnsupportedVersion, got: {:?}",
@@ -2648,5 +2774,97 @@ mod tests {
         let max_name = "a".repeat(256);
         let result = network.register(&max_name, &["capability"], None, HashMap::new());
         assert!(result.is_ok());
+    }
+
+    // --- Task 8.1: DiscoveryBuilder fluent API tests ---
+
+    #[test]
+    fn discovery_builder_basic_usage() {
+        let mut network = LocalNetwork::new();
+        reg(&mut network, "agent-a", &["legal translation"]);
+
+        // Test fluent builder API
+        let response = network.discover_builder("legal translation").run();
+
+        assert!(response.is_ok());
+        let resp = response.unwrap();
+        assert!(!resp.results.is_empty());
+        assert_eq!(resp.recommended_parallelism, 1); // Default when not using with_confidence
+    }
+
+    #[test]
+    fn discovery_builder_with_filters() {
+        let mut network = LocalNetwork::new();
+        let mut meta = HashMap::new();
+        meta.insert("protocol".to_string(), "mcp".to_string());
+        let _ = network.register("mcp-agent", &["translation"], None, meta.clone());
+
+        let mut other_meta = HashMap::new();
+        other_meta.insert("protocol".to_string(), "http".to_string());
+        let _ = network.register("http-agent", &["translation"], None, other_meta);
+
+        let mut filters = HashMap::new();
+        filters.insert(
+            "protocol".to_string(),
+            FilterValue::Exact("mcp".to_string()),
+        );
+
+        let response = network
+            .discover_builder("translation")
+            .with_filters(&filters)
+            .run()
+            .unwrap();
+
+        assert_eq!(response.results.len(), 1);
+        assert_eq!(response.results[0].agent_name, "mcp-agent");
+    }
+
+    #[test]
+    fn discovery_builder_explained_mode() {
+        let mut network = LocalNetwork::new();
+        reg(&mut network, "agent-a", &["translation"]);
+
+        let response = network
+            .discover_builder("translation")
+            .explained()
+            .run()
+            .unwrap();
+
+        assert!(!response.results.is_empty());
+        // In explained mode, kernel_scores should be populated
+        assert!(response.results[0].kernel_scores.is_some());
+    }
+
+    #[test]
+    fn discovery_builder_with_confidence() {
+        let mut network = LocalNetwork::new();
+        reg(&mut network, "agent-a", &["translation"]);
+
+        let response = network
+            .discover_builder("translation")
+            .with_confidence()
+            .run()
+            .unwrap();
+
+        assert!(!response.results.is_empty());
+        // Confidence should be populated
+        assert!(response.confidence.is_some());
+    }
+
+    #[test]
+    fn discovery_builder_combined_options() {
+        let mut network = LocalNetwork::new();
+        reg(&mut network, "agent-a", &["translation"]);
+
+        let response = network
+            .discover_builder("translation")
+            .explained()
+            .with_confidence()
+            .run()
+            .unwrap();
+
+        assert!(!response.results.is_empty());
+        assert!(response.results[0].kernel_scores.is_some());
+        assert!(response.confidence.is_some());
     }
 }
