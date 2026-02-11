@@ -14,6 +14,7 @@ use crate::core::lsh::{ConfidenceInterval, MinHasher};
 use crate::core::signal::{Signal, Tendril};
 use crate::core::types::{HyphaId, KernelType, TrailId};
 
+use super::cooccurrence::CoOccurrenceExpander;
 use super::enzyme_adapter::EnzymeAdapter;
 use super::filter::Filters;
 use super::registry::{AgentRecord, FeedbackIndex};
@@ -268,8 +269,17 @@ pub fn run_pipeline(
     query: &str,
     filters: Option<&Filters>,
     exploration_epsilon: f64,
+    cooccurrence: &CoOccurrenceExpander,
 ) -> (Vec<ScoredCandidate>, KernelEvaluation) {
-    let raw_scores = match scorer.score(query) {
+    // Tokenize query for co-occurrence expansion (simple whitespace tokenization)
+    let query_tokens: Vec<String> = query.split_whitespace().map(|s| s.to_lowercase()).collect();
+
+    // Expand query with co-occurring terms learned from feedback
+    let expanded_tokens = cooccurrence.expand_query(&query_tokens);
+    let expanded_query = expanded_tokens.join(" ");
+
+    // Score using expanded query
+    let raw_scores = match scorer.score(&expanded_query) {
         Ok(scores) => scores,
         Err(e) => {
             tracing::error!(error = %e, "Scorer failed during query evaluation");

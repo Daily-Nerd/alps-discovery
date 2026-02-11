@@ -27,7 +27,8 @@ pub enum NetworkError {
 /// Current snapshot schema version.
 /// v1: original format (includes omega field).
 /// v2: omega removed from HyphaState, tau wired into CapabilityKernel.
-/// v3: added network_epoch, last_activity_duration, conductance for temporal state and Physarum.
+/// v3: added network_epoch, last_activity_duration, conductance for temporal state and Physarum;
+///     added cooccurrence_matrix for self-improving query expansion.
 pub const SNAPSHOT_VERSION: u32 = 3;
 
 /// Serializable snapshot of the entire network state.
@@ -38,6 +39,13 @@ pub(crate) struct NetworkSnapshot {
     /// Network creation time (epoch for temporal state serialization).
     #[serde(default = "std::time::SystemTime::now")]
     pub network_epoch: std::time::SystemTime,
+    /// Co-occurrence matrix for query expansion (query_token, agent_cap_token) -> count.
+    /// Serialized as flat map with "token1,token2" keys for JSON compatibility.
+    #[serde(default)]
+    pub cooccurrence_matrix: HashMap<String, u32>,
+    /// Total feedback count for co-occurrence threshold gating.
+    #[serde(default)]
+    pub cooccurrence_feedback_count: usize,
 }
 
 /// Serializable snapshot of a single agent.
@@ -69,6 +77,35 @@ fn default_conductance() -> f64 {
     1.0
 }
 
+/// Flatten co-occurrence matrix from (token1, token2) -> count to "token1,token2" -> count.
+///
+/// Used for JSON serialization since JSON keys must be strings.
+fn flatten_cooccurrence_matrix(matrix: &HashMap<(String, String), u32>) -> HashMap<String, u32> {
+    matrix
+        .iter()
+        .map(|((qt, act), count)| (format!("{},{}", qt, act), *count))
+        .collect()
+}
+
+/// Unflatten co-occurrence matrix from "token1,token2" -> count to (token1, token2) -> count.
+///
+/// Used for JSON deserialization.
+fn unflatten_cooccurrence_matrix(
+    flat_matrix: &HashMap<String, u32>,
+) -> HashMap<(String, String), u32> {
+    flat_matrix
+        .iter()
+        .filter_map(|(key, count)| {
+            let parts: Vec<&str> = key.splitn(2, ',').collect();
+            if parts.len() == 2 {
+                Some(((parts[0].to_string(), parts[1].to_string()), *count))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 /// Serializable snapshot of a single feedback record.
 #[derive(Serialize, Deserialize)]
 pub(crate) struct FeedbackSnapshot {
@@ -98,6 +135,8 @@ pub(crate) struct AgentLoadData {
 #[allow(dead_code)]
 pub(crate) fn save_snapshot(
     agents: &std::collections::BTreeMap<String, AgentRecord>,
+    cooccurrence_matrix: &HashMap<(String, String), u32>,
+    cooccurrence_feedback_count: usize,
     path: &str,
 ) -> Result<(), NetworkError> {
     let now = std::time::Instant::now();
@@ -106,6 +145,8 @@ pub(crate) fn save_snapshot(
     let snapshot = NetworkSnapshot {
         version: SNAPSHOT_VERSION,
         network_epoch,
+        cooccurrence_matrix: flatten_cooccurrence_matrix(cooccurrence_matrix),
+        cooccurrence_feedback_count,
         agents: agents
             .iter()
             .map(|(name, record)| {
@@ -155,6 +196,8 @@ pub(crate) fn save_snapshot(
 /// Uses tempfile crate for cross-platform atomic rename.
 pub(crate) fn save_snapshot_atomic(
     agents: &std::collections::BTreeMap<String, AgentRecord>,
+    cooccurrence_matrix: &HashMap<(String, String), u32>,
+    cooccurrence_feedback_count: usize,
     path: &str,
 ) -> Result<(), NetworkError> {
     use std::io::Write;
@@ -166,6 +209,8 @@ pub(crate) fn save_snapshot_atomic(
     let snapshot = NetworkSnapshot {
         version: SNAPSHOT_VERSION,
         network_epoch,
+        cooccurrence_matrix: flatten_cooccurrence_matrix(cooccurrence_matrix),
+        cooccurrence_feedback_count,
         agents: agents
             .iter()
             .map(|(name, record)| {
@@ -223,8 +268,15 @@ pub(crate) fn save_snapshot_atomic(
     Ok(())
 }
 
-/// Load agents from a JSON file. Returns the loaded agent data.
-pub(crate) fn load_snapshot(path: &str) -> Result<Vec<AgentLoadData>, NetworkError> {
+/// Loaded snapshot data including agents and co-occurrence matrix.
+pub(crate) struct LoadedSnapshot {
+    pub agents: Vec<AgentLoadData>,
+    pub cooccurrence_matrix: HashMap<(String, String), u32>,
+    pub cooccurrence_feedback_count: usize,
+}
+
+/// Load agents from a JSON file. Returns the loaded agent data and co-occurrence matrix.
+pub(crate) fn load_snapshot(path: &str) -> Result<LoadedSnapshot, NetworkError> {
     let json = std::fs::read_to_string(path)?;
     let snapshot: NetworkSnapshot = serde_json::from_str(&json)?;
 
@@ -263,7 +315,13 @@ pub(crate) fn load_snapshot(path: &str) -> Result<Vec<AgentLoadData>, NetworkErr
         })
         .collect();
 
-    Ok(agents)
+    let cooccurrence_matrix = unflatten_cooccurrence_matrix(&snapshot.cooccurrence_matrix);
+
+    Ok(LoadedSnapshot {
+        agents,
+        cooccurrence_matrix,
+        cooccurrence_feedback_count: snapshot.cooccurrence_feedback_count,
+    })
 }
 
 #[cfg(test)]
@@ -278,7 +336,8 @@ mod tests {
         // This test will be implemented after atomic save is added
         // For now, just verify the function signature exists
         let agents = BTreeMap::new();
-        let result = save_snapshot_atomic(&agents, "/tmp/test_snapshot.json");
+        let cooccurrence = HashMap::new();
+        let result = save_snapshot_atomic(&agents, &cooccurrence, 0, "/tmp/test_snapshot.json");
         // Function should exist but may fail on empty agents
         assert!(result.is_err() || result.is_ok());
     }
@@ -292,7 +351,9 @@ mod tests {
         let snapshot_path = temp_dir.path().join("snapshot.json");
 
         let agents = BTreeMap::new();
-        let result = save_snapshot_atomic(&agents, snapshot_path.to_str().unwrap());
+        let cooccurrence = HashMap::new();
+        let result =
+            save_snapshot_atomic(&agents, &cooccurrence, 0, snapshot_path.to_str().unwrap());
 
         // Should succeed
         assert!(result.is_ok());
@@ -308,6 +369,8 @@ mod tests {
             version: 3,
             agents: vec![],
             network_epoch: std::time::SystemTime::now(),
+            cooccurrence_matrix: HashMap::new(),
+            cooccurrence_feedback_count: 0,
         };
 
         // Should serialize successfully
