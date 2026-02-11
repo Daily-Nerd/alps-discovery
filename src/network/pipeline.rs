@@ -336,18 +336,32 @@ pub fn run_pipeline_with_scores(
         query_signature: query_sig.clone(),
         query_config: QueryConfig,
     });
-    let hyphae: Vec<&Hypha> = agents.values().map(|r| &r.hypha).collect();
+
+    // Filter out agents with open circuits (exclude failing agents from discovery)
+    let hyphae: Vec<&Hypha> = agents
+        .values()
+        .filter(|r| !r.hypha.state.is_circuit_open())
+        .map(|r| &r.hypha)
+        .collect();
 
     // Build a map from agent name to hypha_id for enzyme score lookup.
     let name_to_hypha: HashMap<&str, &HyphaId> = agents
         .iter()
+        .filter(|(_, r)| !r.hypha.state.is_circuit_open())
         .map(|(name, record)| (name.as_str(), &record.hypha.id))
         .collect();
 
     // Build scorer context (HyphaId → raw_similarity) for unified enzyme evaluation.
+    // Filter out agents with open circuits.
     let scorer_context: ScorerContext = score_map
         .iter()
         .filter_map(|(name, &sim)| {
+            // Exclude agents with open circuits
+            if let Some(record) = agents.get(name.as_str()) {
+                if record.hypha.state.is_circuit_open() {
+                    return None;
+                }
+            }
             name_to_hypha
                 .get(name.as_str())
                 .map(|hid| ((*hid).clone(), sim))
@@ -360,6 +374,7 @@ pub fn run_pipeline_with_scores(
     // Build lightweight references — no cloning yet.
     let mut refs: Vec<CandidateRef<'_>> = agents
         .iter()
+        .filter(|(_, r)| !r.hypha.state.is_circuit_open())
         .filter_map(|(name, record)| {
             let sim = score_map.get(name.as_str()).copied().unwrap_or(0.0);
             if sim < scorer.lsh_config.similarity_threshold {

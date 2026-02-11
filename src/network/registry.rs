@@ -185,6 +185,7 @@ pub fn register_agent(
             consecutive_pulse_timeouts: 0,
             forwards_count: crate::core::pheromone::AtomicCounter::new(0),
             conductance: 1.0,
+            circuit_state: crate::core::pheromone::CircuitState::Closed,
         },
         chemistry,
         last_activity: Instant::now(),
@@ -214,7 +215,9 @@ pub fn record_success(
         record.hypha.state.tau = (record.hypha.state.tau + 0.05).max(TAU_FLOOR);
         record.hypha.state.sigma += 0.01;
         record.hypha.state.diameter = (record.hypha.state.diameter + 0.01).min(1.0);
-        record.hypha.state.consecutive_pulse_timeouts = 0;
+
+        // Update circuit breaker state (resets consecutive_pulse_timeouts and closes circuit)
+        record.hypha.state.record_circuit_success();
         record.hypha.last_activity = Instant::now();
 
         // Per-query-type feedback (if query provided).
@@ -234,15 +237,14 @@ pub fn record_failure(
     lsh_config: &LshConfig,
     agent_name: &str,
     query: Option<&str>,
+    circuit_config: &crate::core::pheromone::CircuitBreakerConfig,
 ) {
     if let Some(record) = agents.get_mut(agent_name) {
         // Global penalty (always).
-        record.hypha.state.consecutive_pulse_timeouts = record
-            .hypha
-            .state
-            .consecutive_pulse_timeouts
-            .saturating_add(1);
         record.hypha.state.diameter = (record.hypha.state.diameter - 0.05).max(0.1);
+
+        // Update circuit breaker state (increments consecutive_pulse_timeouts and may open circuit)
+        record.hypha.state.record_circuit_failure(circuit_config);
 
         // Per-query-type feedback (if query provided).
         if let Some(q) = query {
@@ -256,11 +258,17 @@ pub fn record_failure(
 }
 
 /// Apply temporal decay to all agent pheromone state.
-pub fn tick(agents: &mut std::collections::BTreeMap<String, AgentRecord>) {
+pub fn tick(
+    agents: &mut std::collections::BTreeMap<String, AgentRecord>,
+    circuit_config: &crate::core::pheromone::CircuitBreakerConfig,
+) {
     for record in agents.values_mut() {
         let s = &mut record.hypha.state;
         s.tau = (s.tau * 0.995).max(TAU_FLOOR);
         s.sigma *= 0.99;
+
+        // Check if Open circuits should transition to HalfOpen for recovery probe
+        s.check_recovery_probe(circuit_config);
     }
 }
 
@@ -304,7 +312,10 @@ mod tests {
     fn tick_decays_tau() {
         let (mut agents, _) = setup();
         let tau_before = agents.get("test-agent").unwrap().hypha.state.tau;
-        tick(&mut agents);
+        tick(
+            &mut agents,
+            &crate::core::pheromone::CircuitBreakerConfig::new(),
+        );
         let tau_after = agents.get("test-agent").unwrap().hypha.state.tau;
         assert!(tau_after < tau_before);
         assert!(tau_after >= TAU_FLOOR);
@@ -315,7 +326,13 @@ mod tests {
         let (mut agents, _) = setup();
         let config = LshConfig::default();
         // Reduce diameter first so there's room to increase (initial=1.0, cap=1.0).
-        record_failure(&mut agents, &config, "test-agent", None);
+        record_failure(
+            &mut agents,
+            &config,
+            "test-agent",
+            None,
+            &crate::core::pheromone::CircuitBreakerConfig::new(),
+        );
         let d_before = agents.get("test-agent").unwrap().hypha.state.diameter;
         record_success(&mut agents, &config, "test-agent", None);
         let d_after = agents.get("test-agent").unwrap().hypha.state.diameter;
@@ -327,7 +344,13 @@ mod tests {
         let (mut agents, _) = setup();
         let config = LshConfig::default();
         let d_before = agents.get("test-agent").unwrap().hypha.state.diameter;
-        record_failure(&mut agents, &config, "test-agent", None);
+        record_failure(
+            &mut agents,
+            &config,
+            "test-agent",
+            None,
+            &crate::core::pheromone::CircuitBreakerConfig::new(),
+        );
         let d_after = agents.get("test-agent").unwrap().hypha.state.diameter;
         assert!(d_after < d_before);
     }

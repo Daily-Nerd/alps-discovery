@@ -710,6 +710,7 @@ mod tests {
                 consecutive_pulse_timeouts: 0,
                 forwards_count: crate::core::pheromone::AtomicCounter::new(forwards_count),
                 conductance: 1.0,
+                circuit_state: crate::core::pheromone::CircuitState::Closed,
             },
             chemistry,
             last_activity: Instant::now(),
@@ -1619,6 +1620,7 @@ mod tests {
             consecutive_pulse_timeouts: 0,
             forwards_count: crate::core::pheromone::AtomicCounter::new(0),
             conductance: 1.0,
+            circuit_state: crate::core::pheromone::CircuitState::Closed,
         };
 
         // Apply decay with dt = 1.0
@@ -1659,6 +1661,7 @@ mod tests {
             consecutive_pulse_timeouts: 0,
             forwards_count: crate::core::pheromone::AtomicCounter::new(0),
             conductance: 1.0,
+            circuit_state: crate::core::pheromone::CircuitState::Closed,
         };
 
         let initial = state.conductance;

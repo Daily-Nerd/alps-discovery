@@ -110,10 +110,75 @@ fn bench_discover_with_confidence(c: &mut Criterion) {
     });
 }
 
+fn bench_convergence(c: &mut Criterion) {
+    use alps_discovery_native::network::LocalNetwork;
+
+    let mut group = c.benchmark_group("convergence");
+    group.sample_size(20); // Fewer samples for convergence (more expensive)
+
+    // Convergence benchmark: queries until correct agent ranks first
+    group.bench_function("feedback_convergence", |b| {
+        b.iter_custom(|iters| {
+            let start = std::time::Instant::now();
+            for _ in 0..iters {
+                let mut net = LocalNetwork::new();
+
+                // Register test agents
+                net.register(
+                    "translate",
+                    &["legal translation", "document conversion"],
+                    None,
+                    Default::default(),
+                )
+                .unwrap();
+                net.register(
+                    "summarize",
+                    &["document summarization", "brief creation"],
+                    None,
+                    Default::default(),
+                )
+                .unwrap();
+                net.register(
+                    "review",
+                    &["code review", "security audit"],
+                    None,
+                    Default::default(),
+                )
+                .unwrap();
+
+                let query = "translate legal contract";
+                let correct_agent = "translate";
+
+                // Measure queries until convergence
+                for _ in 0..20 {
+                    let results = net.discover(query);
+                    if !results.is_empty() && results[0].agent_name == correct_agent {
+                        break; // Converged
+                    }
+                    // Give feedback
+                    if !results.is_empty() {
+                        let selected = &results[0].agent_name;
+                        if selected == correct_agent {
+                            net.record_success(selected, Some(query));
+                        } else {
+                            net.record_failure(selected, Some(query));
+                            net.record_success(correct_agent, Some(query));
+                        }
+                    }
+                }
+            }
+            start.elapsed()
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group! {
     name = benches;
     config = common::criterion_config();
     targets = bench_discover, bench_discover_with_feedback, bench_run_pipeline,
-              bench_feedback_index_insert, bench_feedback_index_lookup, bench_discover_with_confidence
+              bench_feedback_index_insert, bench_feedback_index_lookup, bench_discover_with_confidence,
+              bench_convergence
 }
 criterion_main!(benches);

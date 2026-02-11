@@ -132,6 +132,7 @@ mod tests {
                     consecutive_pulse_timeouts: 0,
                     forwards_count: AtomicCounter::new(0),
                     conductance: 1.0,
+                    circuit_state: crate::core::pheromone::CircuitState::Closed,
                 },
                 chemistry: Chemistry::new(),
                 last_activity: Instant::now(),

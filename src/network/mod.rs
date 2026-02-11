@@ -12,7 +12,7 @@ mod enzyme_adapter;
 
 mod cooccurrence;
 mod filter;
-mod mycorrhizal;
+pub(crate) mod mycorrhizal;
 mod persistence;
 
 #[cfg(feature = "bench")]
@@ -58,6 +58,7 @@ use crate::scorer::Scorer;
 
 // Re-export public API types.
 pub use filter::{FilterValue, Filters};
+pub use mycorrhizal::MycorrhizalPropagator;
 pub use persistence::NetworkError;
 pub use pipeline::{DiscoveryConfidence, DiscoveryResponse, DiscoveryResult, ExplainedResult};
 pub use replay::{DiscoveryEvent, EventKind, ReplayLog};
@@ -79,7 +80,6 @@ pub struct DriftReport {
 // Internal imports from sub-modules.
 use cooccurrence::CoOccurrenceExpander;
 use enzyme_adapter::EnzymeAdapter;
-use mycorrhizal::MycorrhizalPropagator;
 use pipeline::{derive_confidence, run_pipeline, run_pipeline_with_scores};
 use registry::AgentRecord;
 use scorer_adapter::ScorerAdapter;
@@ -110,6 +110,8 @@ pub struct LocalNetwork {
     cooccurrence: Mutex<CoOccurrenceExpander>,
     /// Mycorrhizal propagator: transitive feedback to similar agents.
     mycorrhizal: MycorrhizalPropagator,
+    /// Circuit breaker configuration for failure exclusion.
+    circuit_breaker: crate::core::pheromone::CircuitBreakerConfig,
 }
 
 impl LocalNetwork {
@@ -124,6 +126,7 @@ impl LocalNetwork {
             replay: Mutex::new(ReplayLog::disabled()),
             cooccurrence: Mutex::new(CoOccurrenceExpander::new()),
             mycorrhizal: MycorrhizalPropagator::new(),
+            circuit_breaker: crate::core::pheromone::CircuitBreakerConfig::new(),
         }
     }
 
@@ -138,6 +141,7 @@ impl LocalNetwork {
             replay: Mutex::new(ReplayLog::disabled()),
             cooccurrence: Mutex::new(CoOccurrenceExpander::new()),
             mycorrhizal: MycorrhizalPropagator::new(),
+            circuit_breaker: crate::core::pheromone::CircuitBreakerConfig::new(),
         }
     }
 
@@ -155,6 +159,7 @@ impl LocalNetwork {
             replay: Mutex::new(ReplayLog::disabled()),
             cooccurrence: Mutex::new(CoOccurrenceExpander::new()),
             mycorrhizal: MycorrhizalPropagator::new(),
+            circuit_breaker: crate::core::pheromone::CircuitBreakerConfig::new(),
         }
     }
 
@@ -170,6 +175,17 @@ impl LocalNetwork {
     /// Set `attenuation = 0.0` to disable propagation entirely (zero overhead).
     pub fn with_mycorrhizal(mut self, propagator: MycorrhizalPropagator) -> Self {
         self.mycorrhizal = propagator;
+        self
+    }
+
+    /// Sets a custom circuit breaker configuration.
+    ///
+    /// Controls when failing agents are excluded from discovery results.
+    pub fn with_circuit_breaker(
+        mut self,
+        config: crate::core::pheromone::CircuitBreakerConfig,
+    ) -> Self {
+        self.circuit_breaker = config;
         self
     }
 
@@ -577,9 +593,16 @@ impl LocalNetwork {
     /// If `query` is provided, stores per-query-type feedback so future
     /// queries similar to this one penalize the agent's ranking — without
     /// affecting unrelated query types.
+    /// Circuit breaker: consecutive failures may open circuit and exclude agent.
     #[tracing::instrument(skip(self), fields(agent_name, query_provided = query.is_some()))]
     pub fn record_failure(&mut self, agent_name: &str, query: Option<&str>) {
-        registry::record_failure(&mut self.agents, &self.scorer.lsh_config, agent_name, query);
+        registry::record_failure(
+            &mut self.agents,
+            &self.scorer.lsh_config,
+            agent_name,
+            query,
+            &self.circuit_breaker,
+        );
         self.total_feedback_count.fetch_add(1, Ordering::Relaxed);
         self.replay
             .lock()
@@ -604,7 +627,7 @@ impl LocalNetwork {
     /// an ephemeral signal.
     #[tracing::instrument(skip(self))]
     pub fn tick(&mut self) {
-        registry::tick(&mut self.agents);
+        registry::tick(&mut self.agents, &self.circuit_breaker);
         safe_lock(&self.replay, "replay tick").record(EventKind::TickApplied);
     }
 
@@ -1022,7 +1045,11 @@ mod tests {
 
     #[test]
     fn record_failure_reduces_ranking() {
-        let mut network = LocalNetwork::new();
+        use crate::core::pheromone::CircuitBreakerConfig;
+        use std::time::Duration;
+        let mut network = LocalNetwork::new().with_circuit_breaker(
+            CircuitBreakerConfig::with_threshold_and_timeout(255, Duration::from_secs(60)),
+        );
         reg(&mut network, "agent-a", &["data processing"]);
         reg(&mut network, "agent-b", &["data processing"]);
 
@@ -1257,7 +1284,11 @@ mod tests {
 
     #[test]
     fn per_query_failure_penalizes_similar_queries() {
-        let mut network = LocalNetwork::new();
+        use crate::core::pheromone::CircuitBreakerConfig;
+        use std::time::Duration;
+        let mut network = LocalNetwork::new().with_circuit_breaker(
+            CircuitBreakerConfig::with_threshold_and_timeout(255, Duration::from_secs(60)),
+        );
         reg(&mut network, "agent-a", &["legal translation"]);
         reg(&mut network, "agent-b", &["legal translation"]);
 
@@ -1283,7 +1314,11 @@ mod tests {
     fn feedback_without_query_still_works_globally() {
         // Backward compat: record_success(name, None) does global diameter boost.
         // First degrade agent-a so the diameter boost is visible.
-        let mut network = LocalNetwork::new();
+        use crate::core::pheromone::CircuitBreakerConfig;
+        use std::time::Duration;
+        let mut network = LocalNetwork::new().with_circuit_breaker(
+            CircuitBreakerConfig::with_threshold_and_timeout(255, Duration::from_secs(60)),
+        );
         reg(&mut network, "agent-a", &["data processing"]);
         reg(&mut network, "agent-b", &["data processing"]);
 
@@ -3154,6 +3189,68 @@ mod tests {
         assert_eq!(
             final_tau_b, initial_tau_b,
             "Agents with overlap below threshold should not receive propagated feedback"
+        );
+    }
+
+    // --- Task 13.3: Circuit breaker integration tests ---
+
+    #[test]
+    fn circuit_breaker_excludes_failing_agents() {
+        use crate::core::pheromone::CircuitBreakerConfig;
+        use std::time::Duration;
+
+        let mut network = LocalNetwork::new().with_circuit_breaker(
+            CircuitBreakerConfig::with_threshold_and_timeout(5, Duration::from_secs(60)),
+        );
+        reg(&mut network, "good-agent", &["translate text"]);
+        reg(&mut network, "failing-agent", &["translate text"]);
+
+        let results = network.discover("translate");
+        assert_eq!(results.len(), 2);
+
+        for _ in 0..5 {
+            network.record_failure("failing-agent", Some("translate"));
+        }
+
+        assert!(network.agents["failing-agent"]
+            .hypha
+            .state
+            .is_circuit_open());
+
+        let results = network.discover("translate");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].agent_name, "good-agent");
+    }
+
+    #[test]
+    fn circuit_breaker_recovery_after_timeout() {
+        use crate::core::pheromone::CircuitBreakerConfig;
+        use std::time::Duration;
+
+        let mut network = LocalNetwork::new().with_circuit_breaker(
+            CircuitBreakerConfig::with_threshold_and_timeout(3, Duration::from_millis(50)),
+        );
+        reg(&mut network, "agent-a", &["translate"]);
+
+        for _ in 0..3 {
+            network.record_failure("agent-a", Some("translate"));
+        }
+
+        assert!(network.agents["agent-a"].hypha.state.is_circuit_open());
+
+        std::thread::sleep(Duration::from_millis(60));
+        network.tick();
+
+        assert_eq!(
+            network.agents["agent-a"].hypha.state.circuit_state,
+            crate::core::pheromone::CircuitState::HalfOpen
+        );
+
+        network.record_success("agent-a", Some("translate"));
+
+        assert_eq!(
+            network.agents["agent-a"].hypha.state.circuit_state,
+            crate::core::pheromone::CircuitState::Closed
         );
     }
 }

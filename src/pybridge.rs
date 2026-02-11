@@ -134,6 +134,7 @@ impl PyLocalNetwork {
     ///     metadata: Optional dict of key-value pairs (protocol, version, framework, etc.).
     ///     invoke: Optional callable for local single-process invocation convenience.
     #[pyo3(signature = (name, capabilities, *, endpoint=None, metadata=None, invoke=None))]
+
     fn register(
         &mut self,
         name: &str,
@@ -1039,5 +1040,88 @@ impl PyQuery {
         args.into_iter()
             .map(|a| Self::parse_single_query(a, py))
             .collect()
+    }
+}
+
+/// Mycorrhizal feedback propagator for transitive learning.
+///
+/// Propagates success feedback to similar agents for faster network learning.
+#[pyclass(name = "MycorrhizalPropagator")]
+#[derive(Clone)]
+pub struct PyMycorrhizalPropagator {
+    inner: crate::network::mycorrhizal::MycorrhizalPropagator,
+}
+
+#[pymethods]
+impl PyMycorrhizalPropagator {
+    #[new]
+    fn new() -> Self {
+        Self {
+            inner: crate::network::mycorrhizal::MycorrhizalPropagator::new(),
+        }
+    }
+
+    #[staticmethod]
+    fn with_config(propagation_attenuation: f64, propagation_threshold: f64) -> Self {
+        Self {
+            inner: crate::network::mycorrhizal::MycorrhizalPropagator::with_config(
+                propagation_attenuation,
+                propagation_threshold,
+            ),
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "MycorrhizalPropagator(attenuation={}, threshold={})",
+            self.inner.propagation_attenuation, self.inner.propagation_threshold
+        )
+    }
+}
+
+impl PyMycorrhizalPropagator {
+    pub fn inner(&self) -> crate::network::mycorrhizal::MycorrhizalPropagator {
+        self.inner.clone()
+    }
+}
+
+/// Circuit breaker configuration for failure exclusion.
+#[pyclass(name = "CircuitBreakerConfig")]
+#[derive(Clone)]
+pub struct PyCircuitBreakerConfig {
+    inner: crate::core::pheromone::CircuitBreakerConfig,
+}
+
+#[pymethods]
+impl PyCircuitBreakerConfig {
+    #[new]
+    fn new() -> Self {
+        Self {
+            inner: crate::core::pheromone::CircuitBreakerConfig::new(),
+        }
+    }
+
+    #[staticmethod]
+    fn with_threshold_and_timeout(failure_threshold: u8, recovery_timeout_secs: u64) -> Self {
+        Self {
+            inner: crate::core::pheromone::CircuitBreakerConfig::with_threshold_and_timeout(
+                failure_threshold,
+                std::time::Duration::from_secs(recovery_timeout_secs),
+            ),
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "CircuitBreakerConfig(threshold={}, timeout={}s)",
+            self.inner.failure_threshold,
+            self.inner.recovery_timeout.as_secs()
+        )
+    }
+}
+
+impl PyCircuitBreakerConfig {
+    pub fn inner(&self) -> crate::core::pheromone::CircuitBreakerConfig {
+        self.inner.clone()
     }
 }
