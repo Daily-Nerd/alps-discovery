@@ -12,6 +12,8 @@ Usage:
         print(f"{r.agent_name}: similarity={r.similarity:.3f}, score={r.score:.3f}")
 """
 
+from typing import Any
+
 try:
     from ._native import (
         DiscoveryConfig,
@@ -30,7 +32,7 @@ except ImportError as e:
     ) from e
 
 
-def capabilities_from_mcp(tools: list[dict]) -> list[str]:
+def capabilities_from_mcp(tools: list[dict[str, Any]]) -> list[str]:
     """Extract capability strings from MCP tool definitions.
 
     Takes the output of an MCP server's list_tools() and builds one
@@ -79,7 +81,7 @@ def capabilities_from_mcp(tools: list[dict]) -> list[str]:
     return caps
 
 
-def capabilities_from_a2a(agent_card: dict) -> list[str]:
+def capabilities_from_a2a(agent_card: dict[str, Any]) -> list[str]:
     """Extract capability strings from Google A2A AgentCard.
 
     Parses an A2A AgentCard JSON object and extracts capability descriptions
