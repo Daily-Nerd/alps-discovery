@@ -97,12 +97,31 @@ impl PyLocalNetwork {
     ///
     /// Args:
     ///     similarity_threshold: Minimum similarity to include in results (default: 0.1).
+    ///     config: Optional DiscoveryConfig for unified configuration.
     ///     scorer: Optional custom scorer object implementing index_capabilities(),
     ///         remove_agent(), and score() methods. Overrides the default MinHash scorer.
     #[new]
-    #[pyo3(signature = (*, similarity_threshold=None, scorer=None))]
-    fn new(similarity_threshold: Option<f64>, scorer: Option<Py<PyAny>>) -> Self {
-        let inner = if let Some(py_scorer) = scorer {
+    #[pyo3(signature = (*, similarity_threshold=None, scorer=None, config=None))]
+    fn new(
+        similarity_threshold: Option<f64>,
+        scorer: Option<Py<PyAny>>,
+        config: Option<PyDiscoveryConfig>,
+    ) -> PyResult<Self> {
+        // If config is provided, use it (ignoring similarity_threshold)
+        let inner = if let Some(cfg) = config {
+            if scorer.is_some() {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "Cannot specify both 'config' and 'scorer' parameters",
+                ));
+            }
+            if similarity_threshold.is_some() {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "Cannot specify both 'config' and 'similarity_threshold' parameters. \
+                     Use config.similarity_threshold instead.",
+                ));
+            }
+            LocalNetwork::with_config(cfg.inner.enzyme.clone(), cfg.inner.lsh.clone())
+        } else if let Some(py_scorer) = scorer {
             // Check if it's our built-in TfIdfScorer first.
             let is_tfidf =
                 Python::attach(|py| py_scorer.bind(py).is_instance_of::<PyTfIdfScorer>());
@@ -119,10 +138,10 @@ impl PyLocalNetwork {
             }
             LocalNetwork::with_config(SLNEnzymeConfig::default(), lsh_config)
         };
-        Self {
+        Ok(Self {
             inner,
             invocables: HashMap::new(),
-        }
+        })
     }
 
     /// Register an agent with its capabilities.
@@ -1122,6 +1141,170 @@ impl PyCircuitBreakerConfig {
 
 impl PyCircuitBreakerConfig {
     pub fn inner(&self) -> crate::core::pheromone::CircuitBreakerConfig {
+        self.inner.clone()
+    }
+}
+
+/// Unified configuration for ALPS Discovery.
+///
+/// Consolidates all tuning parameters into a single configuration object.
+/// Pass this to LocalNetwork() constructor to customize discovery behavior.
+#[pyclass(name = "DiscoveryConfig")]
+#[derive(Clone)]
+pub struct PyDiscoveryConfig {
+    inner: crate::core::config::DiscoveryConfig,
+}
+
+#[pymethods]
+impl PyDiscoveryConfig {
+    /// Create a new DiscoveryConfig with default values.
+    #[new]
+    #[pyo3(signature = (
+        similarity_threshold=0.1,
+        feedback_relevance_threshold=0.3,
+        tie_epsilon=1e-4,
+        tau_floor=0.001,
+        max_feedback_records=100,
+        diameter_initial=0.5,
+        diameter_min=0.01,
+        diameter_max=2.0,
+        epsilon_initial=0.8,
+        epsilon_floor=0.05,
+        epsilon_decay_rate=0.99,
+        max_disagreement_split=3
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        similarity_threshold: f64,
+        feedback_relevance_threshold: f64,
+        tie_epsilon: f64,
+        tau_floor: f64,
+        max_feedback_records: usize,
+        diameter_initial: f64,
+        diameter_min: f64,
+        diameter_max: f64,
+        epsilon_initial: f64,
+        epsilon_floor: f64,
+        epsilon_decay_rate: f64,
+        max_disagreement_split: usize,
+    ) -> PyResult<Self> {
+        let config = crate::core::config::DiscoveryConfig {
+            lsh: crate::core::config::LshConfig {
+                similarity_threshold,
+                ..Default::default()
+            },
+            enzyme: crate::core::enzyme::SLNEnzymeConfig {
+                max_disagreement_split,
+                quorum: crate::core::enzyme::Quorum::Majority,
+            },
+            exploration: crate::core::config::ExplorationConfig {
+                epsilon_initial,
+                epsilon_floor,
+                epsilon_decay_rate,
+            },
+            feedback_relevance_threshold,
+            tie_epsilon,
+            tau_floor,
+            max_feedback_records,
+            diameter_initial,
+            diameter_min,
+            diameter_max,
+        };
+
+        // Validate at construction time
+        config.validate().map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!("Invalid configuration: {}", e))
+        })?;
+
+        Ok(Self { inner: config })
+    }
+
+    /// Get similarity threshold.
+    #[getter]
+    fn similarity_threshold(&self) -> f64 {
+        self.inner.lsh.similarity_threshold
+    }
+
+    /// Get feedback relevance threshold.
+    #[getter]
+    fn feedback_relevance_threshold(&self) -> f64 {
+        self.inner.feedback_relevance_threshold
+    }
+
+    /// Get tie epsilon.
+    #[getter]
+    fn tie_epsilon(&self) -> f64 {
+        self.inner.tie_epsilon
+    }
+
+    /// Get tau floor.
+    #[getter]
+    fn tau_floor(&self) -> f64 {
+        self.inner.tau_floor
+    }
+
+    /// Get max feedback records.
+    #[getter]
+    fn max_feedback_records(&self) -> usize {
+        self.inner.max_feedback_records
+    }
+
+    /// Get diameter initial.
+    #[getter]
+    fn diameter_initial(&self) -> f64 {
+        self.inner.diameter_initial
+    }
+
+    /// Get diameter min.
+    #[getter]
+    fn diameter_min(&self) -> f64 {
+        self.inner.diameter_min
+    }
+
+    /// Get diameter max.
+    #[getter]
+    fn diameter_max(&self) -> f64 {
+        self.inner.diameter_max
+    }
+
+    /// Get epsilon initial.
+    #[getter]
+    fn epsilon_initial(&self) -> f64 {
+        self.inner.exploration.epsilon_initial
+    }
+
+    /// Get epsilon floor.
+    #[getter]
+    fn epsilon_floor(&self) -> f64 {
+        self.inner.exploration.epsilon_floor
+    }
+
+    /// Get epsilon decay rate.
+    #[getter]
+    fn epsilon_decay_rate(&self) -> f64 {
+        self.inner.exploration.epsilon_decay_rate
+    }
+
+    /// Get max disagreement split.
+    #[getter]
+    fn max_disagreement_split(&self) -> usize {
+        self.inner.enzyme.max_disagreement_split
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "DiscoveryConfig(similarity_threshold={}, feedback_relevance_threshold={}, \
+             tau_floor={}, diameter_initial={})",
+            self.inner.lsh.similarity_threshold,
+            self.inner.feedback_relevance_threshold,
+            self.inner.tau_floor,
+            self.inner.diameter_initial
+        )
+    }
+}
+
+impl PyDiscoveryConfig {
+    pub fn inner(&self) -> crate::core::config::DiscoveryConfig {
         self.inner.clone()
     }
 }

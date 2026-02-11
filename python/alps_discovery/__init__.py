@@ -14,6 +14,7 @@ Usage:
 
 try:
     from ._native import (
+        DiscoveryConfig,
         DiscoveryResponse,
         DiscoveryResult,
         ExplainedResult,
@@ -154,6 +155,7 @@ def capabilities_from_a2a(agent_card: dict) -> list[str]:
 
 
 __all__ = [
+    "DiscoveryConfig",
     "DiscoveryResponse",
     "DiscoveryResult",
     "ExplainedResult",

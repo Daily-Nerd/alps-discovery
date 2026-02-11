@@ -413,7 +413,7 @@ impl ReasoningKernel for TemporalRecencyKernel {
 // ---------------------------------------------------------------------------
 
 /// Quorum mode for kernel voting decisions.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Quorum {
     /// Simple majority (>50% agreement). Default, backwards compatible.
     Majority,
@@ -452,7 +452,7 @@ impl Quorum {
 // ---------------------------------------------------------------------------
 
 /// Configuration for the multi-kernel discovery enzyme.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SLNEnzymeConfig {
     /// Maximum number of hyphae to split across on disagreement (default: 3).
     pub max_disagreement_split: usize,

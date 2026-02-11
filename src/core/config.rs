@@ -152,9 +152,255 @@ impl ExplorationConfig {
     }
 }
 
+/// Unified configuration for ALPS Discovery.
+///
+/// Consolidates all tuning parameters: LSH, enzyme, exploration, feedback, and diameter settings.
+/// This provides a single point of configuration for the LocalNetwork.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DiscoveryConfig {
+    /// LSH configuration (similarity thresholds, dimensions, shingle mode).
+    pub lsh: LshConfig,
+    /// Enzyme configuration (max disagreement split, quorum mode).
+    pub enzyme: SLNEnzymeConfig,
+    /// Exploration configuration (epsilon decay).
+    pub exploration: ExplorationConfig,
+    /// Feedback relevance threshold for per-query feedback matching (default: 0.3).
+    pub feedback_relevance_threshold: f64,
+    /// Tie-breaking epsilon for strict score equality detection (default: 1e-4).
+    pub tie_epsilon: f64,
+    /// Minimum tau floor to prevent zero-trap absorbing state (default: 0.001).
+    pub tau_floor: f64,
+    /// Maximum feedback records to retain per agent (default: 100).
+    pub max_feedback_records: usize,
+    /// Initial diameter value for new agents (default: 0.5).
+    pub diameter_initial: f64,
+    /// Minimum diameter value (default: 0.01).
+    pub diameter_min: f64,
+    /// Maximum diameter value (default: 2.0).
+    pub diameter_max: f64,
+}
+
+impl Default for DiscoveryConfig {
+    fn default() -> Self {
+        Self {
+            lsh: LshConfig::default(),
+            enzyme: SLNEnzymeConfig::default(),
+            exploration: ExplorationConfig::default(),
+            feedback_relevance_threshold: 0.3,
+            tie_epsilon: 1e-4,
+            tau_floor: 0.001,
+            max_feedback_records: 100,
+            diameter_initial: 0.5,
+            diameter_min: 0.01,
+            diameter_max: 2.0,
+        }
+    }
+}
+
+impl DiscoveryConfig {
+    /// Validate all configuration parameters.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DiscoveryError::Config` if any parameter is out of valid range.
+    pub fn validate(&self) -> Result<(), crate::error::DiscoveryError> {
+        use crate::error::DiscoveryError;
+
+        // Validate exploration config
+        self.exploration.validate()?;
+
+        // Validate feedback relevance threshold
+        if self.feedback_relevance_threshold < 0.0 || self.feedback_relevance_threshold > 1.0 {
+            return Err(DiscoveryError::Config(format!(
+                "feedback_relevance_threshold must be in [0, 1], got {}",
+                self.feedback_relevance_threshold
+            )));
+        }
+
+        // Validate tie epsilon
+        if self.tie_epsilon <= 0.0 {
+            return Err(DiscoveryError::Config(format!(
+                "tie_epsilon must be > 0, got {}",
+                self.tie_epsilon
+            )));
+        }
+
+        // Validate tau floor
+        if self.tau_floor <= 0.0 {
+            return Err(DiscoveryError::Config(format!(
+                "tau_floor must be > 0, got {}",
+                self.tau_floor
+            )));
+        }
+
+        // Validate diameter range
+        if self.diameter_min <= 0.0 {
+            return Err(DiscoveryError::Config(format!(
+                "diameter_min must be > 0, got {}",
+                self.diameter_min
+            )));
+        }
+        if self.diameter_max <= self.diameter_min {
+            return Err(DiscoveryError::Config(format!(
+                "diameter_max ({}) must be > diameter_min ({})",
+                self.diameter_max, self.diameter_min
+            )));
+        }
+        if self.diameter_initial < self.diameter_min || self.diameter_initial > self.diameter_max {
+            return Err(DiscoveryError::Config(format!(
+                "diameter_initial ({}) must be in [{}, {}]",
+                self.diameter_initial, self.diameter_min, self.diameter_max
+            )));
+        }
+
+        Ok(())
+    }
+}
+
+use crate::core::enzyme::SLNEnzymeConfig;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // DiscoveryConfig Tests (Requirement 14)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn discovery_config_default_is_valid() {
+        let config = DiscoveryConfig::default();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn discovery_config_validates_feedback_threshold() {
+        let config = DiscoveryConfig {
+            feedback_relevance_threshold: 1.5, // Invalid: > 1.0
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+
+        let config = DiscoveryConfig {
+            feedback_relevance_threshold: -0.1, // Invalid: < 0.0
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+
+        let config = DiscoveryConfig {
+            feedback_relevance_threshold: 0.5, // Valid
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn discovery_config_validates_tie_epsilon() {
+        let config = DiscoveryConfig {
+            tie_epsilon: 0.0, // Invalid: must be > 0
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+
+        let config = DiscoveryConfig {
+            tie_epsilon: -0.001, // Invalid: must be > 0
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+
+        let config = DiscoveryConfig {
+            tie_epsilon: 1e-6, // Valid
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn discovery_config_validates_tau_floor() {
+        let config = DiscoveryConfig {
+            tau_floor: 0.0, // Invalid: must be > 0
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+
+        let config = DiscoveryConfig {
+            tau_floor: -0.001, // Invalid: must be > 0
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+
+        let config = DiscoveryConfig {
+            tau_floor: 0.0001, // Valid
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn discovery_config_validates_diameter_range() {
+        // Invalid: diameter_min <= 0
+        let config = DiscoveryConfig {
+            diameter_min: 0.0,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+
+        // Invalid: diameter_max <= diameter_min
+        let config = DiscoveryConfig {
+            diameter_min: 0.5,
+            diameter_max: 0.3,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+
+        // Invalid: diameter_initial < diameter_min
+        let config = DiscoveryConfig {
+            diameter_initial: 0.005,
+            diameter_min: 0.01,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+
+        // Invalid: diameter_initial > diameter_max
+        let config = DiscoveryConfig {
+            diameter_initial: 3.0,
+            diameter_max: 2.0,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+
+        // Valid: diameter_initial in range
+        let config = DiscoveryConfig {
+            diameter_initial: 0.5,
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn discovery_config_exposes_all_parameters() {
+        let config = DiscoveryConfig {
+            lsh: LshConfig::default(),
+            enzyme: SLNEnzymeConfig::default(),
+            exploration: ExplorationConfig::default(),
+            feedback_relevance_threshold: 0.4,
+            tie_epsilon: 2e-4,
+            tau_floor: 0.002,
+            max_feedback_records: 200,
+            diameter_initial: 0.6,
+            diameter_min: 0.02,
+            diameter_max: 1.5,
+        };
+
+        // Verify all fields are accessible
+        assert_eq!(config.feedback_relevance_threshold, 0.4);
+        assert_eq!(config.tie_epsilon, 2e-4);
+        assert_eq!(config.tau_floor, 0.002);
+        assert_eq!(config.max_feedback_records, 200);
+        assert_eq!(config.diameter_initial, 0.6);
+        assert_eq!(config.diameter_min, 0.02);
+        assert_eq!(config.diameter_max, 1.5);
+    }
 
     #[test]
     fn exploration_config_epsilon_handles_u64_max() {
