@@ -1,6 +1,6 @@
 [package]
 name = "alps-discovery"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2021"
 description = "Local agent discovery powered by bio-inspired multi-kernel routing"
 license = "Apache-2.0"

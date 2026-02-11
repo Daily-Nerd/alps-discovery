@@ -5,6 +5,31 @@ All notable changes to ALPS Discovery will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2] - 2026-02-11
+
+### Fixed
+
+- **Results sorting bug**: Added `MIN_SCORE_DIFF_FOR_SHUFFLE` (5%) threshold to prevent epsilon-greedy exploration from shuffling agents with clearly different scores. Fixes issue where lower-scoring agents appeared first in results due to CI overlap shuffle. `results[0]` now reliably returns the best match.
+
+- **Attribute name inconsistency**: Added `final_score` and `raw_similarity` as property aliases to `DiscoveryResult` so README examples work in both regular and explain modes. Prevents `AttributeError` when using explain-mode attributes in regular mode.
+
+### Changed
+
+- **README**: Added comments clarifying which attributes are available in explain mode vs regular mode.
+
+## [0.1.1] - 2026-02-11
+
+### Fixed
+
+- **Wheel compatibility**: Build wheels for Python 3.11, 3.12, and 3.13 (previously only 3.11)
+- **Linux compatibility**: Target manylinux_2_17 (glibc 2.17+) instead of manylinux_2_34 for broader compatibility with Ubuntu 20.04, Amazon Linux 2, and older systems
+- **macOS coverage**: Added Intel Mac (x86_64) wheels in addition to ARM64 (M-series)
+
+### Changed
+
+- Use `PyO3/maturin-action` for automated multi-Python builds
+- Use `pypa/gh-action-pypi-publish` for official Trusted Publisher workflow
+
 ## [0.1.0] - 2026-02-10
 
 ### Fixed
