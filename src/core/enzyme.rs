@@ -103,6 +103,84 @@ impl ReasoningKernel for CapabilityKernel {
     }
 }
 
+/// Hill equation capability kernel: bio-inspired cooperative binding model.
+///
+/// Replaces linear tau scaling with sigmoidal Hill equation for "tipping point" behavior.
+/// Score: `scorer_similarity * diameter * (tau^n / (K^n + tau^n))`
+///
+/// Where:
+/// - `n` is the Hill coefficient (cooperativity, default 2.0)
+/// - `K` is the half-maximal concentration (default 0.1)
+///
+/// Behavior:
+/// - tau << K: agent is suppressed (tau_factor → 0)
+/// - tau = K: agent at half strength (tau_factor ≈ 0.5)
+/// - tau >> K: agent is strongly preferred (tau_factor → 1.0)
+pub struct HillCapabilityKernel {
+    /// Hill coefficient (n): degree of cooperativity. Higher values = sharper transition.
+    pub hill_coefficient: f64,
+    /// Half-maximal concentration (K): tau value at which factor = 0.5.
+    pub half_maximal: f64,
+}
+
+impl HillCapabilityKernel {
+    /// Create a new Hill capability kernel with validation.
+    pub fn new(hill_coefficient: f64, half_maximal: f64) -> Result<Self, String> {
+        if hill_coefficient <= 0.0 {
+            return Err(format!(
+                "Hill coefficient must be > 0, got {}",
+                hill_coefficient
+            ));
+        }
+        if half_maximal <= 0.0 {
+            return Err(format!(
+                "Half-maximal concentration must be > 0, got {}",
+                half_maximal
+            ));
+        }
+        Ok(Self {
+            hill_coefficient,
+            half_maximal,
+        })
+    }
+}
+
+impl Default for HillCapabilityKernel {
+    fn default() -> Self {
+        Self {
+            hill_coefficient: 2.0,
+            half_maximal: 0.1,
+        }
+    }
+}
+
+impl ReasoningKernel for HillCapabilityKernel {
+    fn kernel_type(&self) -> KernelType {
+        KernelType::CapabilityMatching
+    }
+
+    fn evaluate(
+        &self,
+        _signal: &Signal,
+        hyphae: &[&Hypha],
+        scorer_context: &ScorerContext,
+    ) -> KernelRecommendation {
+        let mut ranked: Vec<(HyphaId, f64)> = hyphae
+            .iter()
+            .map(|h| {
+                let similarity = scorer_context.get(&h.id).copied().unwrap_or(0.0);
+                // Hill equation: tau^n / (K^n + tau^n)
+                let tau_n = h.state.tau.powf(self.hill_coefficient);
+                let k_n = self.half_maximal.powf(self.hill_coefficient);
+                let tau_factor = tau_n / (k_n + tau_n);
+                (h.id.clone(), similarity * h.state.diameter * tau_factor)
+            })
+            .collect();
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        KernelRecommendation { ranked }
+    }
+}
+
 /// Novelty-seeking kernel: prioritizes less-explored hyphae.
 pub struct NoveltyKernel;
 
@@ -147,6 +225,147 @@ impl ReasoningKernel for LoadBalancingKernel {
             .iter()
             .map(|h| {
                 let score = h.state.diameter / (1.0 + h.state.forwards_count.get() as f64);
+                (h.id.clone(), score)
+            })
+            .collect();
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        KernelRecommendation { ranked }
+    }
+}
+
+/// Michaelis-Menten load balancing kernel: bio-inspired enzyme kinetics saturation model.
+///
+/// Replaces linear inverse with hyperbolic saturation for asymptotic throughput ceiling.
+/// Score: `Vmax * available_capacity / (Km + available_capacity)`
+///
+/// Where:
+/// - `Vmax = diameter` (maximum score at zero load)
+/// - `Km` is the Michaelis constant (half-saturation, default 10.0)
+/// - `available_capacity = capacity_threshold - forwards_count`
+///
+/// Behavior:
+/// - forwards = 0: score → Vmax
+/// - forwards = threshold: score → 0 asymptotically
+/// - available_capacity = Km: score = Vmax / 2
+pub struct MichaelisMentenLoadBalancingKernel {
+    /// Michaelis constant (Km): half-saturation point.
+    pub km: f64,
+    /// Capacity threshold: max forwards before saturation.
+    pub capacity_threshold: f64,
+}
+
+impl MichaelisMentenLoadBalancingKernel {
+    /// Create a new Michaelis-Menten load balancing kernel with validation.
+    pub fn new(km: f64, capacity_threshold: f64) -> Result<Self, String> {
+        if km <= 0.0 {
+            return Err(format!("Km must be > 0, got {}", km));
+        }
+        if capacity_threshold <= 0.0 {
+            return Err(format!(
+                "Capacity threshold must be > 0, got {}",
+                capacity_threshold
+            ));
+        }
+        Ok(Self {
+            km,
+            capacity_threshold,
+        })
+    }
+}
+
+impl Default for MichaelisMentenLoadBalancingKernel {
+    fn default() -> Self {
+        Self {
+            km: 10.0,
+            capacity_threshold: 100.0,
+        }
+    }
+}
+
+impl ReasoningKernel for MichaelisMentenLoadBalancingKernel {
+    fn kernel_type(&self) -> KernelType {
+        KernelType::LoadBalancing
+    }
+
+    fn evaluate(
+        &self,
+        _signal: &Signal,
+        hyphae: &[&Hypha],
+        _scorer_context: &ScorerContext,
+    ) -> KernelRecommendation {
+        let mut ranked: Vec<(HyphaId, f64)> = hyphae
+            .iter()
+            .map(|h| {
+                let forwards = h.state.forwards_count.get() as f64;
+                let available_capacity = (self.capacity_threshold - forwards).max(0.0);
+                let vmax = h.state.diameter;
+                // Michaelis-Menten equation
+                let score = vmax * available_capacity / (self.km + available_capacity);
+                (h.id.clone(), score)
+            })
+            .collect();
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        KernelRecommendation { ranked }
+    }
+}
+
+/// Physarum flow kernel: bio-inspired conductance model for load balancing.
+///
+/// Based on Physarum polycephalum slime mold network optimization.
+/// Conductance increases on successful routing, decays over time.
+/// Score: `conductance / (1 + active_forwards)`
+///
+/// This is an optional alternative to MichaelisMentenLoadBalancingKernel,
+/// selectable via SLNEnzymeConfig. Provides biologically-proven optimal
+/// flow distribution with dynamic adaptation.
+pub struct PhysarumFlowKernel {
+    /// Decay rate (alpha) for tube dynamics equation: dD/dt = |Q| - alpha * D
+    pub alpha: f64,
+    /// Minimum conductance floor (prevents zero-trap).
+    pub conductance_floor: f64,
+    /// Flow magnitude increment on successful routing.
+    pub flow_magnitude: f64,
+}
+
+impl PhysarumFlowKernel {
+    /// Apply conductance decay (called by tick()).
+    pub fn apply_decay(&self, state: &mut crate::core::pheromone::HyphaState, dt: f64) {
+        state.conductance =
+            (state.conductance - self.alpha * state.conductance * dt).max(self.conductance_floor);
+    }
+
+    /// Increment conductance on success feedback.
+    pub fn record_success(&self, state: &mut crate::core::pheromone::HyphaState) {
+        state.conductance += self.flow_magnitude;
+    }
+}
+
+impl Default for PhysarumFlowKernel {
+    fn default() -> Self {
+        Self {
+            alpha: 0.1,
+            conductance_floor: 0.01,
+            flow_magnitude: 1.0,
+        }
+    }
+}
+
+impl ReasoningKernel for PhysarumFlowKernel {
+    fn kernel_type(&self) -> KernelType {
+        KernelType::LoadBalancing
+    }
+
+    fn evaluate(
+        &self,
+        _signal: &Signal,
+        hyphae: &[&Hypha],
+        _scorer_context: &ScorerContext,
+    ) -> KernelRecommendation {
+        let mut ranked: Vec<(HyphaId, f64)> = hyphae
+            .iter()
+            .map(|h| {
+                let forwards = h.state.forwards_count.get() as f64;
+                let score = h.state.conductance / (1.0 + forwards);
                 (h.id.clone(), score)
             })
             .collect();
@@ -490,6 +709,7 @@ mod tests {
                 sigma,
                 consecutive_pulse_timeouts: 0,
                 forwards_count: crate::core::pheromone::AtomicCounter::new(forwards_count),
+                conductance: 1.0,
             },
             chemistry,
             last_activity: Instant::now(),
@@ -1177,5 +1397,274 @@ mod tests {
     fn quorum_supermajority_accepts_one() {
         let result = Quorum::supermajority(1.0);
         assert!(result.is_ok());
+    }
+
+    // --- Task 9.1: Hill equation capability kernel tests ---
+
+    #[test]
+    fn hill_capability_kernel_sigmoid_behavior() {
+        // Test sigmoid curve: tau << K → near 0, tau = K → 0.5, tau >> K → near 1
+        let kernel = HillCapabilityKernel {
+            hill_coefficient: 2.0,
+            half_maximal: 0.1,
+        };
+
+        // Create hyphae with different tau values
+        let sig = QuerySignature::default();
+        let chem = Chemistry::default();
+
+        // tau = K/10 = 0.01 → should be near 0
+        let h_low = make_hypha_with_tau(1, 1.0, 0.0, 0, chem.clone(), 0.01);
+        // tau = K = 0.1 → should be near 0.5
+        let h_mid = make_hypha_with_tau(2, 1.0, 0.0, 0, chem.clone(), 0.1);
+        // tau = 10*K = 1.0 → should be near 1.0
+        let h_high = make_hypha_with_tau(3, 1.0, 0.0, 0, chem.clone(), 1.0);
+
+        let hyphae = vec![&h_low, &h_mid, &h_high];
+        let mut scorer_context = ScorerContext::new();
+        // All have same similarity for this test
+        scorer_context.insert(h_low.id.clone(), 1.0);
+        scorer_context.insert(h_mid.id.clone(), 1.0);
+        scorer_context.insert(h_high.id.clone(), 1.0);
+
+        let signal = make_tendril_signal(sig);
+        let rec = kernel.evaluate(&signal, &hyphae, &scorer_context);
+
+        // Extract scores
+        let low_score = rec.ranked.iter().find(|(id, _)| *id == h_low.id).unwrap().1;
+        let mid_score = rec.ranked.iter().find(|(id, _)| *id == h_mid.id).unwrap().1;
+        let high_score = rec
+            .ranked
+            .iter()
+            .find(|(id, _)| *id == h_high.id)
+            .unwrap()
+            .1;
+
+        // Verify sigmoid behavior
+        assert!(
+            low_score < 0.1,
+            "tau << K should give score near 0, got {:.3}",
+            low_score
+        );
+        assert!(
+            mid_score > 0.4 && mid_score < 0.6,
+            "tau = K should give score near 0.5, got {:.3}",
+            mid_score
+        );
+        assert!(
+            high_score > 0.9,
+            "tau >> K should give score near 1.0, got {:.3}",
+            high_score
+        );
+    }
+
+    #[test]
+    fn hill_capability_kernel_validates_parameters() {
+        // Should accept valid parameters
+        let k1 = HillCapabilityKernel::new(2.0, 0.1);
+        assert!(k1.is_ok());
+
+        // Should reject n <= 0
+        let k2 = HillCapabilityKernel::new(0.0, 0.1);
+        assert!(k2.is_err());
+
+        // Should reject K <= 0
+        let k3 = HillCapabilityKernel::new(2.0, 0.0);
+        assert!(k3.is_err());
+    }
+
+    // --- Task 9.2: Michaelis-Menten load balancing kernel tests ---
+
+    #[test]
+    fn michaelis_menten_load_balancing_hyperbolic_saturation() {
+        // Test hyperbolic saturation: forwards=0 → Vmax, available_capacity=Km → Vmax/2
+        let kernel = MichaelisMentenLoadBalancingKernel {
+            km: 10.0,
+            capacity_threshold: 100.0,
+        };
+
+        let sig = QuerySignature::default();
+        let chem = Chemistry::default();
+
+        // forwards = 0 → available_capacity = 100, score → Vmax
+        let h_zero = make_hypha(1, 1.0, 0.0, 0, chem.clone());
+        // forwards = 90 → available_capacity = 10 = Km, score = Vmax/2
+        let h_km = make_hypha(2, 1.0, 0.0, 90, chem.clone());
+        // forwards = 99 → available_capacity = 1, score ≈ 0
+        let h_saturated = make_hypha(3, 1.0, 0.0, 99, chem.clone());
+
+        let hyphae = vec![&h_zero, &h_km, &h_saturated];
+        let scorer_context = ScorerContext::new();
+
+        let signal = make_tendril_signal(sig);
+        let rec = kernel.evaluate(&signal, &hyphae, &scorer_context);
+
+        let zero_score = rec
+            .ranked
+            .iter()
+            .find(|(id, _)| *id == h_zero.id)
+            .unwrap()
+            .1;
+        let km_score = rec.ranked.iter().find(|(id, _)| *id == h_km.id).unwrap().1;
+        let saturated_score = rec
+            .ranked
+            .iter()
+            .find(|(id, _)| *id == h_saturated.id)
+            .unwrap()
+            .1;
+
+        // Verify Michaelis-Menten behavior
+        // available=100: 1.0 * 100 / (10 + 100) = 0.909
+        assert!(
+            zero_score > 0.85,
+            "forwards=0 should give score near Vmax, got {:.3}",
+            zero_score
+        );
+
+        // available=Km: 1.0 * 10 / (10 + 10) = 0.5
+        assert!(
+            (km_score - 0.5).abs() < 0.05,
+            "available_capacity=Km should give score=Vmax/2, got {:.3}",
+            km_score
+        );
+
+        // available=1: 1.0 * 1 / (10 + 1) ≈ 0.091
+        assert!(
+            saturated_score < 0.15,
+            "forwards→capacity should give low score, got {:.3}",
+            saturated_score
+        );
+    }
+
+    #[test]
+    fn michaelis_menten_load_balancing_validates_km() {
+        // Should accept valid Km
+        let k1 = MichaelisMentenLoadBalancingKernel::new(10.0, 100.0);
+        assert!(k1.is_ok());
+
+        // Should reject Km <= 0
+        let k2 = MichaelisMentenLoadBalancingKernel::new(0.0, 100.0);
+        assert!(k2.is_err());
+    }
+
+    // --- Task 9.3: Physarum flow kernel tests ---
+
+    #[test]
+    fn physarum_flow_kernel_conductance_based_scoring() {
+        // Score = conductance / (1 + forwards_count)
+        let kernel = PhysarumFlowKernel {
+            alpha: 0.1,
+            conductance_floor: 0.01,
+            flow_magnitude: 1.0,
+        };
+
+        let sig = QuerySignature::default();
+        let chem = Chemistry::default();
+
+        // High conductance, low forwards
+        let mut h_high = make_hypha(1, 1.0, 0.0, 0, chem.clone());
+        h_high.state.conductance = 10.0;
+
+        // Low conductance, low forwards
+        let mut h_low = make_hypha(2, 1.0, 0.0, 0, chem.clone());
+        h_low.state.conductance = 1.0;
+
+        // High conductance, high forwards
+        let mut h_busy = make_hypha(3, 1.0, 0.0, 50, chem.clone());
+        h_busy.state.conductance = 10.0;
+
+        let hyphae = vec![&h_high, &h_low, &h_busy];
+        let scorer_context = ScorerContext::new();
+
+        let signal = make_tendril_signal(sig);
+        let rec = kernel.evaluate(&signal, &hyphae, &scorer_context);
+
+        let high_score = rec
+            .ranked
+            .iter()
+            .find(|(id, _)| *id == h_high.id)
+            .unwrap()
+            .1;
+        let low_score = rec.ranked.iter().find(|(id, _)| *id == h_low.id).unwrap().1;
+        let busy_score = rec
+            .ranked
+            .iter()
+            .find(|(id, _)| *id == h_busy.id)
+            .unwrap()
+            .1;
+
+        // High conductance + low forwards should score highest
+        assert!(
+            high_score > low_score,
+            "high conductance should outscore low conductance"
+        );
+        assert!(
+            high_score > busy_score,
+            "low forwards should outscore high forwards with same conductance"
+        );
+    }
+
+    #[test]
+    fn physarum_flow_kernel_conductance_decay() {
+        let kernel = PhysarumFlowKernel {
+            alpha: 0.1,
+            conductance_floor: 0.01,
+            flow_magnitude: 1.0,
+        };
+
+        let mut state = HyphaState {
+            diameter: 1.0,
+            tau: 0.1,
+            sigma: 0.0,
+            consecutive_pulse_timeouts: 0,
+            forwards_count: crate::core::pheromone::AtomicCounter::new(0),
+            conductance: 1.0,
+        };
+
+        // Apply decay with dt = 1.0
+        kernel.apply_decay(&mut state, 1.0);
+
+        // conductance = 1.0 - 0.1 * 1.0 * 1.0 = 0.9
+        assert!(
+            (state.conductance - 0.9).abs() < 0.01,
+            "decay should reduce conductance to 0.9, got {:.3}",
+            state.conductance
+        );
+
+        // Decay to near floor
+        for _ in 0..100 {
+            kernel.apply_decay(&mut state, 1.0);
+        }
+
+        // Should clamp to floor
+        assert!(
+            state.conductance >= kernel.conductance_floor,
+            "should not go below floor"
+        );
+        assert!(state.conductance < 0.02, "should decay to near floor");
+    }
+
+    #[test]
+    fn physarum_flow_kernel_success_increases_conductance() {
+        let kernel = PhysarumFlowKernel {
+            alpha: 0.1,
+            conductance_floor: 0.01,
+            flow_magnitude: 1.0,
+        };
+
+        let mut state = HyphaState {
+            diameter: 1.0,
+            tau: 0.1,
+            sigma: 0.0,
+            consecutive_pulse_timeouts: 0,
+            forwards_count: crate::core::pheromone::AtomicCounter::new(0),
+            conductance: 1.0,
+        };
+
+        let initial = state.conductance;
+        kernel.record_success(&mut state);
+
+        // conductance should increase by flow_magnitude
+        assert_eq!(state.conductance, initial + kernel.flow_magnitude);
     }
 }

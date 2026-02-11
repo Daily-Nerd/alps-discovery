@@ -184,6 +184,7 @@ pub fn register_agent(
             sigma: 0.0,
             consecutive_pulse_timeouts: 0,
             forwards_count: crate::core::pheromone::AtomicCounter::new(0),
+            conductance: 1.0,
         },
         chemistry,
         last_activity: Instant::now(),

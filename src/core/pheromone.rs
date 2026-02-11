@@ -76,6 +76,8 @@ impl<'de> Deserialize<'de> for AtomicCounter {
 /// - `forwards_count`: Total signals routed through this slot. Used by
 ///   LoadBalancingKernel: diameter/(1+forwards_count) favors less-used agents.
 ///   Uses `AtomicCounter` for interior mutability during concurrent discovery.
+/// - `conductance`: Physarum-inspired flow conductance. Increases on success,
+///   decays over time. Used by PhysarumFlowKernel for bio-inspired load balancing.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HyphaState {
     /// Connection diameter (strength/capacity). Adjusted by feedback.
@@ -89,6 +91,8 @@ pub struct HyphaState {
     /// Number of signals forwarded through this slot (for load balancing).
     /// Atomic for concurrent `discover(&self)` support.
     pub forwards_count: AtomicCounter,
+    /// Physarum-inspired flow conductance (for PhysarumFlowKernel).
+    pub conductance: f64,
 }
 
 impl HyphaState {
@@ -103,6 +107,7 @@ impl HyphaState {
             sigma: 0.0,
             consecutive_pulse_timeouts: 0,
             forwards_count: AtomicCounter::new(0),
+            conductance: 1.0, // Default conductance for PhysarumFlowKernel
         }
     }
 }
