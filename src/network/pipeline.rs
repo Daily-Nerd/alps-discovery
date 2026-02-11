@@ -487,6 +487,11 @@ pub fn run_pipeline_with_scores(
         // different capability matches.
         const STRICT_TIE_EPSILON: f64 = 1e-4;
 
+        // Minimum score difference to prevent CI-based shuffle.
+        // If scores differ by more than this, don't shuffle even if CIs overlap.
+        // This prevents shuffling clearly different matches (0.22 vs 0.12).
+        const MIN_SCORE_DIFF_FOR_SHUFFLE: f64 = 0.05;
+
         let strict_tie_count = refs
             .iter()
             .take_while(|r| (r.final_score - top_score).abs() < STRICT_TIE_EPSILON)
@@ -495,13 +500,19 @@ pub fn run_pipeline_with_scores(
         let top_ci = &refs[0].similarity_ci;
         let ci_tie_count = refs
             .iter()
-            .take_while(|r| r.similarity_ci.overlaps(top_ci))
+            .take_while(|r| {
+                // Only include in CI group if:
+                // 1. CIs overlap, AND
+                // 2. Scores are close enough (within 5%)
+                r.similarity_ci.overlaps(top_ci)
+                    && (top_score - r.final_score) < MIN_SCORE_DIFF_FOR_SHUFFLE
+            })
             .count();
 
         // Start with strict ties (always shuffled for fairness).
         let mut shuffle_count = strict_tie_count;
 
-        // Epsilon extends to CI-overlap group for exploration.
+        // Epsilon extends to CI-overlap group for exploration (only if scores are close).
         if ci_tie_count > shuffle_count && exploration_epsilon > 0.0 {
             let counter = TIE_BREAK_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
             let explore_seed = xxh3_64_with_seed(query_text.as_bytes(), counter);

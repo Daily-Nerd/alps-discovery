@@ -764,6 +764,18 @@ impl PyDiscoveryResult {
             self.agent_name, self.similarity, self.score, ep
         )
     }
+
+    /// Alias for `score` (matches ExplainedResult naming for consistency).
+    #[getter]
+    fn final_score(&self) -> f64 {
+        self.score
+    }
+
+    /// Alias for `similarity` (matches ExplainedResult naming for consistency).
+    #[getter]
+    fn raw_similarity(&self) -> f64 {
+        self.similarity
+    }
 }
 
 /// Extended discovery result with full scoring breakdown.

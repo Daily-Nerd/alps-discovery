@@ -133,6 +133,8 @@ Inspect how scores are calculated:
 ```python
 results = network.discover("translate contract", explain=True)
 for r in results:
+    # Explain mode provides full scoring breakdown
+    # Note: raw_similarity and final_score also work in regular mode (as aliases)
     print(f"{r.agent_name}: sim={r.raw_similarity:.3f}, "
           f"diameter={r.diameter:.3f}, feedback={r.feedback_factor:.3f}, "
           f"score={r.final_score:.3f}")
