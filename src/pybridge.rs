@@ -709,6 +709,9 @@ impl PyLocalNetwork {
             Some(crate::network::DiscoveryConfidence::Split { alternative_agents }) => {
                 ("split".to_string(), None, alternative_agents.clone())
             }
+            Some(crate::network::DiscoveryConfidence::NoViableAgents) => {
+                ("no_viable_agents".to_string(), None, Vec::new())
+            }
             None => ("none".to_string(), None, Vec::new()),
         };
 

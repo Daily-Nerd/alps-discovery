@@ -179,7 +179,7 @@ impl HyphaState {
     ///
     /// Increments consecutive_pulse_timeouts and opens circuit if threshold reached.
     pub fn record_circuit_failure(&mut self, config: &CircuitBreakerConfig) {
-        self.consecutive_pulse_timeouts += 1;
+        self.consecutive_pulse_timeouts = self.consecutive_pulse_timeouts.saturating_add(1);
         if self.consecutive_pulse_timeouts >= config.failure_threshold {
             self.circuit_state = CircuitState::Open {
                 opened_at: Instant::now(),
@@ -379,5 +379,20 @@ mod tests {
         state.circuit_state = CircuitState::HalfOpen;
         state.check_recovery_probe(&config);
         assert_eq!(state.circuit_state, CircuitState::HalfOpen);
+    }
+
+    #[test]
+    fn circuit_breaker_saturates_at_max_u8() {
+        let mut state = HyphaState::new(1.0);
+        let config = CircuitBreakerConfig::new();
+
+        // Hammer it with 300 failures (more than u8::MAX)
+        for _ in 0..300 {
+            state.record_circuit_failure(&config);
+        }
+
+        // Should saturate at 255, not wrap to 0
+        assert_eq!(state.consecutive_pulse_timeouts, 255);
+        assert!(state.is_circuit_open());
     }
 }

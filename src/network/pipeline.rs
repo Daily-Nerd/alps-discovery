@@ -77,6 +77,8 @@ pub enum DiscoveryConfidence {
     Majority { dissenting_kernel: KernelType },
     /// No majority. Caller should consider parallel execution.
     Split { alternative_agents: Vec<String> },
+    /// No viable agents (all circuit-open or below threshold).
+    NoViableAgents,
 }
 
 /// Discovery response with confidence signal.
@@ -204,7 +206,7 @@ pub(crate) fn derive_confidence(
 ) -> (DiscoveryConfidence, usize) {
     let top_picks = &kernel_eval.top_picks;
     if top_picks.is_empty() {
-        return (DiscoveryConfidence::Unanimous, 1);
+        return (DiscoveryConfidence::NoViableAgents, 0);
     }
 
     // Count votes per hypha.
@@ -888,5 +890,93 @@ mod tests {
                 "feedback_factor {} must be in [-1.0, 1.0]", factor
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // NoViableAgents confidence tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_no_viable_agents_when_all_circuit_open() {
+        use crate::core::config::LshConfig;
+        use crate::core::enzyme::SLNEnzymeConfig;
+        use crate::core::hyphae::Hypha;
+        use crate::core::pheromone::{CircuitState, HyphaState};
+        use crate::network::cooccurrence::CoOccurrenceExpander;
+        use crate::network::enzyme_adapter::EnzymeAdapter;
+        use crate::network::registry::{name_to_hypha_id, AgentRecord, FeedbackIndex};
+        use crate::network::scorer_adapter::ScorerAdapter;
+        use std::collections::BTreeMap;
+
+        use crate::core::chemistry::Chemistry;
+        use crate::core::pheromone::AtomicCounter;
+        use crate::core::types::PeerAddr;
+        use std::time::Instant;
+
+        // Create agents with open circuits
+        let mut agents = BTreeMap::new();
+        for i in 0..3 {
+            let agent_name = format!("agent-{}", i);
+            let hypha_id = name_to_hypha_id(&agent_name);
+            let mut metadata = HashMap::new();
+            metadata.insert("test".to_string(), "value".to_string());
+            let record = AgentRecord {
+                capabilities: vec!["test capability".to_string()],
+                endpoint: None,
+                metadata,
+                hypha: Hypha {
+                    id: hypha_id,
+                    peer: PeerAddr(format!("local://{}", agent_name)),
+                    state: HyphaState {
+                        diameter: 1.0,
+                        tau: 0.01,
+                        sigma: 0.0,
+                        consecutive_pulse_timeouts: 0,
+                        forwards_count: AtomicCounter::new(0),
+                        conductance: 1.0,
+                        circuit_state: CircuitState::Open {
+                            opened_at: Instant::now(),
+                        }, // Circuit is OPEN
+                    },
+                    chemistry: Chemistry::new(),
+                    last_activity: Instant::now(),
+                },
+                feedback: FeedbackIndex::new(),
+            };
+            agents.insert(agent_name, record);
+        }
+
+        let lsh_config = LshConfig::default();
+        let scorer = ScorerAdapter::new(lsh_config);
+        let mut enzyme = EnzymeAdapter::new(SLNEnzymeConfig::default());
+        let _cooccurrence = CoOccurrenceExpander::new();
+
+        // All agents have zero similarity (doesn't matter, they're all circuit-open)
+        let mut score_map = HashMap::new();
+        score_map.insert("agent-0".to_string(), 0.0);
+        score_map.insert("agent-1".to_string(), 0.0);
+        score_map.insert("agent-2".to_string(), 0.0);
+
+        let (results, kernel_eval, best_below_threshold) = run_pipeline_with_scores(
+            &agents,
+            &scorer,
+            &mut enzyme,
+            "test query",
+            score_map,
+            None,
+            0.0,
+        );
+
+        // All agents circuit-open, so no results
+        assert!(results.is_empty());
+
+        // Derive confidence should return NoViableAgents
+        let enzyme_config = SLNEnzymeConfig::default();
+        let (confidence, parallelism) = derive_confidence(&kernel_eval, &agents, &enzyme_config);
+        assert_eq!(confidence, DiscoveryConfidence::NoViableAgents);
+        assert_eq!(parallelism, 0);
+
+        // best_below_threshold should still be populated with the highest similarity
+        assert!(best_below_threshold.is_some());
     }
 }
