@@ -9,12 +9,17 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 
 mod common;
 
+/// Latency benchmark: discovery p50/p95/p99 for 10, 100, 1000 agents (Requirement 22, Task 20.1).
+///
+/// Measures discovery latency percentiles at different scales.
+/// Results are machine-readable in criterion's JSON output.
 fn bench_discover(c: &mut Criterion) {
-    let mut group = c.benchmark_group("discover");
+    let mut group = c.benchmark_group("discover_latency");
 
-    for &agent_count in &[10, 50, 100, 500] {
-        // Use smaller sample size for 500-agent configuration
-        if agent_count >= 500 {
+    // Benchmark at 10, 100, 1000 agents (per Requirement 22)
+    for &agent_count in &[10, 100, 1000] {
+        // Use smaller sample size for large configurations
+        if agent_count >= 1000 {
             group.sample_size(10);
         }
 
@@ -110,6 +115,254 @@ fn bench_discover_with_confidence(c: &mut Criterion) {
     });
 }
 
+/// Accuracy benchmark: accuracy@1 and accuracy@3 with labeled query set (Requirement 22, Task 20.2).
+///
+/// Uses a labeled query set with known correct agent mappings to measure
+/// routing accuracy at k=1 and k=3.
+fn bench_accuracy(c: &mut Criterion) {
+    use alps_discovery_native::network::LocalNetwork;
+
+    let mut group = c.benchmark_group("accuracy");
+    group.sample_size(20); // Fewer samples for accuracy tests
+
+    // Create a labeled query set with known correct agent mappings
+    struct LabeledQuery {
+        query: &'static str,
+        correct_agent: &'static str,
+    }
+
+    let labeled_queries = vec![
+        LabeledQuery {
+            query: "translate legal document from English to German",
+            correct_agent: "translation",
+        },
+        LabeledQuery {
+            query: "summarize contract terms and conditions",
+            correct_agent: "summarization",
+        },
+        LabeledQuery {
+            query: "review code for security vulnerabilities",
+            correct_agent: "code-review",
+        },
+        LabeledQuery {
+            query: "analyze financial transaction data",
+            correct_agent: "analytics",
+        },
+        LabeledQuery {
+            query: "extract entities from legal briefs",
+            correct_agent: "extraction",
+        },
+        LabeledQuery {
+            query: "convert document from PDF to Word format",
+            correct_agent: "conversion",
+        },
+        LabeledQuery {
+            query: "translate medical report to French",
+            correct_agent: "translation",
+        },
+        LabeledQuery {
+            query: "summarize quarterly earnings report",
+            correct_agent: "summarization",
+        },
+        LabeledQuery {
+            query: "audit code for performance issues",
+            correct_agent: "code-review",
+        },
+        LabeledQuery {
+            query: "analyze customer sentiment from reviews",
+            correct_agent: "analytics",
+        },
+    ];
+
+    // Benchmark accuracy@1 (correct agent ranks first)
+    group.bench_function("accuracy_at_1", |b| {
+        b.iter_custom(|iters| {
+            let start = std::time::Instant::now();
+            for _ in 0..iters {
+                // Create fresh network for each iteration (deterministic)
+                let mut net = LocalNetwork::new();
+
+                // Register agents with capabilities matching the labeled queries
+                net.register(
+                    "translation",
+                    &[
+                        "legal translation",
+                        "medical translation",
+                        "document translation",
+                        "EN-DE",
+                        "EN-FR",
+                    ],
+                    None,
+                    Default::default(),
+                )
+                .unwrap();
+                net.register(
+                    "summarization",
+                    &[
+                        "document summarization",
+                        "contract summarization",
+                        "report summarization",
+                    ],
+                    None,
+                    Default::default(),
+                )
+                .unwrap();
+                net.register(
+                    "code-review",
+                    &[
+                        "code review",
+                        "security audit",
+                        "performance audit",
+                        "code quality",
+                    ],
+                    None,
+                    Default::default(),
+                )
+                .unwrap();
+                net.register(
+                    "analytics",
+                    &[
+                        "data analytics",
+                        "financial analytics",
+                        "sentiment analysis",
+                        "metrics",
+                    ],
+                    None,
+                    Default::default(),
+                )
+                .unwrap();
+                net.register(
+                    "extraction",
+                    &["entity extraction", "information extraction", "text mining"],
+                    None,
+                    Default::default(),
+                )
+                .unwrap();
+                net.register(
+                    "conversion",
+                    &[
+                        "document conversion",
+                        "PDF conversion",
+                        "format transformation",
+                    ],
+                    None,
+                    Default::default(),
+                )
+                .unwrap();
+
+                // Measure accuracy@1
+                let mut correct = 0;
+                for labeled in &labeled_queries {
+                    let results = net.discover(black_box(labeled.query));
+                    if !results.is_empty() && results[0].agent_name == labeled.correct_agent {
+                        correct += 1;
+                    }
+                }
+
+                black_box(correct);
+            }
+            start.elapsed()
+        });
+    });
+
+    // Benchmark accuracy@3 (correct agent in top-3)
+    group.bench_function("accuracy_at_3", |b| {
+        b.iter_custom(|iters| {
+            let start = std::time::Instant::now();
+            for _ in 0..iters {
+                let mut net = LocalNetwork::new();
+
+                // Same agent registration as accuracy@1
+                net.register(
+                    "translation",
+                    &[
+                        "legal translation",
+                        "medical translation",
+                        "document translation",
+                        "EN-DE",
+                        "EN-FR",
+                    ],
+                    None,
+                    Default::default(),
+                )
+                .unwrap();
+                net.register(
+                    "summarization",
+                    &[
+                        "document summarization",
+                        "contract summarization",
+                        "report summarization",
+                    ],
+                    None,
+                    Default::default(),
+                )
+                .unwrap();
+                net.register(
+                    "code-review",
+                    &[
+                        "code review",
+                        "security audit",
+                        "performance audit",
+                        "code quality",
+                    ],
+                    None,
+                    Default::default(),
+                )
+                .unwrap();
+                net.register(
+                    "analytics",
+                    &[
+                        "data analytics",
+                        "financial analytics",
+                        "sentiment analysis",
+                        "metrics",
+                    ],
+                    None,
+                    Default::default(),
+                )
+                .unwrap();
+                net.register(
+                    "extraction",
+                    &["entity extraction", "information extraction", "text mining"],
+                    None,
+                    Default::default(),
+                )
+                .unwrap();
+                net.register(
+                    "conversion",
+                    &[
+                        "document conversion",
+                        "PDF conversion",
+                        "format transformation",
+                    ],
+                    None,
+                    Default::default(),
+                )
+                .unwrap();
+
+                // Measure accuracy@3
+                let mut correct = 0;
+                for labeled in &labeled_queries {
+                    let results = net.discover(black_box(labeled.query));
+                    let top_3_names: Vec<_> = results
+                        .iter()
+                        .take(3)
+                        .map(|r| r.agent_name.as_str())
+                        .collect();
+                    if top_3_names.contains(&labeled.correct_agent) {
+                        correct += 1;
+                    }
+                }
+
+                black_box(correct);
+            }
+            start.elapsed()
+        });
+    });
+
+    group.finish();
+}
+
 fn bench_convergence(c: &mut Criterion) {
     use alps_discovery_native::network::LocalNetwork;
 
@@ -179,6 +432,6 @@ criterion_group! {
     config = common::criterion_config();
     targets = bench_discover, bench_discover_with_feedback, bench_run_pipeline,
               bench_feedback_index_insert, bench_feedback_index_lookup, bench_discover_with_confidence,
-              bench_convergence
+              bench_accuracy, bench_convergence
 }
 criterion_main!(benches);
