@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write  # Required for trusted publishing to PyPI
 
 jobs:
   build-wheels:
@@ -79,6 +80,8 @@ jobs:
     runs-on: ubuntu-latest
     # Only publish to PyPI for non-prerelease tags
     if: "!contains(github.ref, 'alpha') && !contains(github.ref, 'beta') && !contains(github.ref, 'rc')"
+    permissions:
+      id-token: write  # Required for trusted publishing
 
     steps:
       - uses: actions/checkout@v4
@@ -92,7 +95,5 @@ jobs:
       - name: Install maturin
         run: pip install maturin
 
-      - name: Publish to PyPI
-        env:
-          MATURIN_PYPI_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
-        run: maturin upload dist/*.whl
+      - name: Publish to PyPI (Trusted Publisher)
+        run: maturin upload --skip-existing dist/*.whl
