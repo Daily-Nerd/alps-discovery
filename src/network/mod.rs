@@ -3253,4 +3253,129 @@ mod tests {
             crate::core::pheromone::CircuitState::Closed
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Concurrent Safety Tests (Requirement 17)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn concurrent_discover_calls_no_panics() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let mut network = LocalNetwork::new();
+        reg(&mut network, "agent-1", &["translate documents"]);
+        reg(&mut network, "agent-2", &["summarize text"]);
+        reg(&mut network, "agent-3", &["analyze data"]);
+
+        // Wrap in Arc for shared access across threads
+        let network = Arc::new(network);
+        let mut handles = vec![];
+
+        // Spawn 8 threads, each calling discover() 100 times
+        for _thread_id in 0..8 {
+            let network_clone = Arc::clone(&network);
+            let handle = thread::spawn(move || {
+                for i in 0..100 {
+                    let query = format!("translate document {}", i);
+                    let results = network_clone.discover(&query);
+                    // Just verify we got results, don't panic
+                    assert!(results.len() <= 3);
+                }
+            });
+            handles.push(handle);
+        }
+
+        // Wait for all threads to complete
+        for handle in handles {
+            handle.join().expect("thread should not panic");
+        }
+
+        // If we get here, no panics occurred during concurrent access
+    }
+
+    #[test]
+    fn concurrent_discover_and_feedback_no_corruption() {
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+
+        let mut network = LocalNetwork::new();
+        reg(&mut network, "agent-1", &["translate documents"]);
+        reg(&mut network, "agent-2", &["summarize text"]);
+
+        // Use Mutex for &mut self methods (record_success/failure)
+        let network = Arc::new(Mutex::new(network));
+        let mut handles = vec![];
+
+        // Spawn 4 threads doing discovery + feedback
+        for _thread_id in 0..4 {
+            let network_clone = Arc::clone(&network);
+            let handle = thread::spawn(move || {
+                for i in 0..50 {
+                    // Discover (immutable access via lock)
+                    let query = format!("translate {}", i);
+                    let results = {
+                        let net = network_clone.lock().unwrap();
+                        net.discover(&query)
+                    };
+
+                    // Record feedback if we got results (mutable access)
+                    if !results.is_empty() {
+                        let agent_name = results[0].agent_name.clone();
+                        let mut net = network_clone.lock().unwrap();
+                        if i % 2 == 0 {
+                            net.record_success(&agent_name, Some(&query));
+                        } else {
+                            net.record_failure(&agent_name, Some(&query));
+                        }
+                    }
+                }
+            });
+            handles.push(handle);
+        }
+
+        // Wait for all threads
+        for handle in handles {
+            handle.join().expect("thread should not panic");
+        }
+
+        // Verify epsilon has decayed (feedback was recorded)
+        let network = network.lock().unwrap();
+        let epsilon = network.current_epsilon();
+        assert!(
+            epsilon < 0.8,
+            "epsilon should have decayed from initial 0.8"
+        );
+        assert!(epsilon >= 0.05, "epsilon should not fall below floor 0.05");
+    }
+
+    #[test]
+    fn concurrent_discover_preserves_interior_mutability() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let mut network = LocalNetwork::new();
+        reg(&mut network, "test-agent", &["test capability"]);
+
+        // The key property: discover(&self) can be called concurrently
+        // because interior mutability (Mutex) protects shared state
+        let network = Arc::new(network);
+        let mut handles = vec![];
+
+        for _ in 0..8 {
+            let network_clone = Arc::clone(&network);
+            let handle = thread::spawn(move || {
+                for _ in 0..100 {
+                    let _results = network_clone.discover("test query");
+                }
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle
+                .join()
+                .expect("concurrent discover() should not panic");
+        }
+    }
 }
